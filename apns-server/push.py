@@ -779,6 +779,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.path == "/health/latest":
+            self._handle_health_latest()
+            return
         if self.path == "/version":
             self._send_json(200, {"ok": True, "version": self.server_version})
             return
@@ -1032,6 +1035,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "action": "lock"})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
+            return
+        elif self.path == "/health/report":
+            self._handle_health_report(body)
             return
         elif self.path == "/settings":
             for k, v in body.items():
@@ -3078,6 +3084,49 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_pet_state_get(self):
         """GET /pet/state — 当前 latest 状态."""
         self._send_json(200, {"ok": True, "latest": self.state.pet.latest()})
+
+    # ---------- health monitoring ----------
+
+    _HEALTH_FILE = Path.home() / ".ots" / "health_reports.jsonl"
+
+    def _handle_health_report(self, body: dict[str, Any]):
+        """POST /health/report — iOS app uploads HealthKit summary."""
+        import json as _json
+        ts = body.get("ts", "")
+        data = body.get("data", {})
+        if not data:
+            self._send_json(400, {"error": "data required"})
+            return
+        record = {"ts": ts, "received": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"), **data}
+        self._HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with self._HEALTH_FILE.open("a") as f:
+            f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info("health report saved: steps=%s hr=%s sleep=%s",
+                     data.get("steps"), data.get("heart_rate"), data.get("sleep_hours"))
+        self._send_json(200, {"ok": True})
+
+    def _handle_health_latest(self):
+        """GET /health/latest — return most recent health report."""
+        import json as _json
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        if not self._HEALTH_FILE.exists():
+            self._send_json(200, {"ok": True, "report": None})
+            return
+        last_line = ""
+        with self._HEALTH_FILE.open() as f:
+            for line in f:
+                if line.strip():
+                    last_line = line.strip()
+        if not last_line:
+            self._send_json(200, {"ok": True, "report": None})
+            return
+        try:
+            report = _json.loads(last_line)
+        except Exception:
+            report = None
+        self._send_json(200, {"ok": True, "report": report})
 
     def _handle_pet_state_post(self, body: dict[str, Any]):
         """POST /pet/state — chain hook 上报状态. body: {state, reason?, ts?}.

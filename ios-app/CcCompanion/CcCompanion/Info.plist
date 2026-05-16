@@ -11,6 +11,10 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSHealthShareUsageDescription</key>
+	<string>让主人监控小狗狗的健康数据（步数、心率、睡眠等）</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>CcCompanion 不会写入健康数据</string>
 	<key>NSCameraUsageDescription</key>
 	<string>拍照发给 Cc</string>
 	<key>NSLocalNetworkUsageDescription</key>
