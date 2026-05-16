@@ -861,7 +861,15 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "version": self.server_version})
             return
         if self.path == "/web/chat" or self.path.startswith("/web/chat?"):
-            self._serve_web_chat()
+            from urllib.parse import urlparse, parse_qs
+            _qs = parse_qs(urlparse(self.path).query)
+            _qt = _qs.get("token", [None])[0]
+            if _qt and self.state.shared_secret and _qt == self.state.shared_secret:
+                self._serve_web_chat(auth_token=_qt)
+            elif not self.state.strict_auth or self._auth_matches():
+                self._serve_web_chat(auth_token=None)
+            else:
+                self._send_json(401, {"error": "unauthorized — use /web/chat?token=YOUR_SECRET"})
             return
         if self.path == "/gomoku/state":
             self._handle_gomoku_state()
@@ -2661,14 +2669,28 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- chat handlers ----------
 
-    def _serve_web_chat(self):
-        html = WEB_CHAT_HTML.encode("utf-8")
+    def _serve_web_chat(self, auth_token=None):
+        html = WEB_CHAT_HTML
+        if auth_token:
+            inject = f'  const AUTH_TOKEN = {json.dumps(auth_token)};\n  history.replaceState({{}}, \'\', \'/web/chat\');\n'
+        else:
+            inject = '  const AUTH_TOKEN = \'\';\n'
+        html = html.replace('<script>\n', '<script>\n' + inject, 1)
+        html = html.replace(
+            "const res = await fetch(url, { cache: 'no-store' });",
+            "const res = await fetch(url, { cache: 'no-store', headers: AUTH_TOKEN ? {'X-Auth-Token': AUTH_TOKEN} : {} });",
+        )
+        html = html.replace(
+            "headers: { 'Content-Type': 'application/json' },",
+            "headers: { 'Content-Type': 'application/json', ...(AUTH_TOKEN ? {'X-Auth-Token': AUTH_TOKEN} : {}) },",
+        )
+        data = html.encode('utf-8')
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(html)))
+        self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(html)
+        self.wfile.write(data)
 
     def _handle_chat_streaming(self):
         """GET /chat/streaming — return partial assistant output from tmux while typing."""
