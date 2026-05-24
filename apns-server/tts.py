@@ -108,45 +108,11 @@ class TTS:
 
     @classmethod
     def _translate(cls, text: str, target: str) -> str | None:
-        """Translate Chinese text to target language with claude --print. Fail closed."""
+        """Translation disabled — used to spawn `claude --print` subprocesses; user
+        does not want any headless `claude -p`/`--print` invocations. Returns None
+        so multi-lang TTS falls back to the original Chinese (or skips that lang)."""
         import logging
         logger = logging.getLogger("cc-apns-server.tts")
-        if not text or not text.strip():
-            return None
-        target_name = {
-            "en": "English",
-            "ja": "Japanese (natural casual male tone)",
-        }.get(target)
-        if not target_name:
-            return None
-        prompt = (
-            f"Translate the following Chinese to {target_name}. "
-            "Output ONLY the translation, no explanation, no quotes, no notes. "
-            "Keep the casual intimate tone (this is between Cc and his girlfriend). "
-            f"Text:\n\n{text}"
-        )
-        env = {
-            **os.environ,
-            "PATH": os.environ.get("PATH", "") + ":/usr/local/bin:/opt/homebrew/bin",
-        }
-        try:
-            proc = subprocess.run(
-                ["claude", "--print", "--model", "claude-haiku-4-5", prompt],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("translate timeout target=%s len=%d", target, len(text))
-            return None
-        except Exception as e:
-            logger.warning("translate exception: %s", e)
-            return None
-        if proc.returncode != 0:
-            logger.warning("translate fail rc=%s err=%s", proc.returncode, proc.stderr[:300])
-            return None
-        out = proc.stdout.strip()
-        if not out:
-            return None
-        return out
+        logger.info("translate disabled (no claude --print) target=%s len=%d", target, len(text) if text else 0)
+        return None
+
