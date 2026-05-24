@@ -37,6 +37,31 @@
 
 set -uo pipefail
 
+echo "[$(date +%Y-%m-%d\ %H:%M:%S)] hook invoked pid=$$ TMUX_PANE=${TMUX_PANE:-unset}" >> /tmp/ccc_stop_hook.log
+
+# Only run inside ccc-chat tmux pane — skip for tg-ember and other sessions.
+# Try TMUX_PANE first; if unset (Claude Code >=2.1.146 stopped propagating it),
+# match our ancestor PID against the ccc-chat pane PID.
+CURRENT_SESSION=""
+if [ -n "${TMUX_PANE:-}" ]; then
+    CURRENT_SESSION=$(tmux display-message -t "$TMUX_PANE" -p '#{session_name}' 2>/dev/null || echo "")
+else
+    CCC_PANE_PID=$(tmux list-panes -t ccc-chat -F '#{pane_pid}' 2>/dev/null | head -1)
+    if [ -n "$CCC_PANE_PID" ]; then
+        _pid=$$
+        while [ "$_pid" -gt 1 ] 2>/dev/null; do
+            if [ "$_pid" = "$CCC_PANE_PID" ]; then
+                CURRENT_SESSION="ccc-chat"
+                break
+            fi
+            _pid=$(awk '{print $4}' /proc/$_pid/stat 2>/dev/null || echo 0)
+        done
+    fi
+fi
+if [ "$CURRENT_SESSION" != "ccc-chat" ]; then
+    exit 0
+fi
+
 SERVER_URL="${CCC_SERVER_URL:-http://127.0.0.1:8795}"
 AUTH_TOKEN="${CCC_AUTH_TOKEN:-}"
 # 兜底从 server 自动生成的 secret 文件读
@@ -71,10 +96,46 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
     exit 0
 fi
 
+# Always extract thinking blocks from transcript (stdin last_assistant_message never includes them)
+# Wait for transcript to flush — hook may fire before the final write
+sleep 1
+THINKING_TEXT=""
+if [ -f "$TRANSCRIPT_PATH" ]; then
+    REVERSE_CAT_T="tail -r"
+    if ! tail -r /dev/null 2>/dev/null; then REVERSE_CAT_T="tac"; fi
+    THINKING_TEXT=$($REVERSE_CAT_T "$TRANSCRIPT_PATH" | python3 -c '
+import json, sys
+parts = []
+def is_real_user(obj):
+    """Distinguish a typed user message from a tool_result wrapped as user."""
+    if obj.get("type") != "user": return False
+    content = obj.get("message", {}).get("content")
+    if isinstance(content, str): return True  # plain text user
+    if isinstance(content, list):
+        # tool_result entries are NOT real user input
+        return not any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
+    return False
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    if is_real_user(obj): break
+    if obj.get("type") == "assistant":
+        for c in obj.get("message", {}).get("content", []):
+            if isinstance(c, dict) and c.get("type") == "thinking" and c.get("thinking"):
+                parts.append(c["thinking"])
+parts.reverse()
+if parts: print("💭" + "\n".join(parts))
+' 2>/dev/null)
+fi
+
 # Prefer stdin last_assistant_message (新版 Claude Code 直接给), fallback transcript
 if [ -n "$DIRECT_LAST" ]; then
     LAST_ASSISTANT="$DIRECT_LAST"
-    log "using stdin last_assistant_message (chars=${#LAST_ASSISTANT})"
+    log "using stdin last_assistant_message (chars=${#LAST_ASSISTANT}) thinking=${#THINKING_TEXT}"
 else
     # Claude Code transcript flush 慢 — 等 file size 稳定 (连续两次相等 或最长 ~3 秒)
     LAST_SIZE=-1
@@ -102,7 +163,15 @@ else
     fi
     LAST_ASSISTANT=$($REVERSE_CAT "$TRANSCRIPT_PATH" | python3 -c '
 import json, sys
-collected = []
+text_parts = []
+think_parts = []
+def is_real_user(obj):
+    if obj.get("type") != "user": return False
+    content = obj.get("message", {}).get("content")
+    if isinstance(content, str): return True
+    if isinstance(content, list):
+        return not any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
+    return False
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
@@ -110,27 +179,47 @@ for line in sys.stdin:
         obj = json.loads(line)
     except Exception:
         continue
-    t = obj.get("type")
-    if t == "user":
-        break
-    if t == "assistant":
-        msg = obj.get("message", {})
-        content = msg.get("content", [])
-        text_parts = [
-            c.get("text", "")
-            for c in content
-            if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
-        ]
-        if text_parts:
-            collected.append("\n".join(text_parts))
-collected.reverse()
-print("\n\n".join(collected))
+    if is_real_user(obj): break
+    if obj.get("type") == "assistant":
+        for c in obj.get("message", {}).get("content", []):
+            if not isinstance(c, dict): continue
+            if c.get("type") == "text" and c.get("text"):
+                text_parts.append(c["text"])
+            elif c.get("type") == "thinking" and c.get("thinking"):
+                think_parts.append(c["thinking"])
+text_parts.reverse()
+think_parts.reverse()
+if text_parts:
+    print("\n".join(text_parts))
+elif think_parts:
+    print("\n".join(think_parts))
 ' 2>/dev/null)
 fi
 
 if [ -z "$LAST_ASSISTANT" ]; then
     log "empty assistant text — skip"
     exit 0
+fi
+
+# POST thinking 单独一条 (如果有)
+if [ -n "$THINKING_TEXT" ]; then
+    THINK_PAYLOAD=$(THINK_TEXT="$THINKING_TEXT" python3 -c '
+import json, os, datetime
+ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+print(json.dumps({
+    "role": "assistant",
+    "text": os.environ["THINK_TEXT"],
+    "source": "ccc-stop-hook",
+    "ts": ts,
+}))
+')
+    curl -s -o /dev/null \
+        -X POST "$SERVER_URL/chat/append" \
+        -H "Content-Type: application/json" \
+        -H "X-Auth-Token: $AUTH_TOKEN" \
+        --data "$THINK_PAYLOAD" \
+        --max-time 8 2>>"$LOG_PATH"
+    log "posted thinking (chars=${#THINKING_TEXT})"
 fi
 
 # POST 到 /chat/append

@@ -363,6 +363,8 @@ class ServerState:
                 self.active_session = _as.get("active_sid", "opia")
             except Exception:
                 pass
+        # Chat 专用 session（独立于 Terminal 的 active_session）
+        self.chat_session: str = "ccc-chat"
         self.diary = Diary(Path("~/Documents/星原/眠的小家/日记/").expanduser())
         # 2026-05-11 OTS Diary tab — chain↔用户 chat-style journaling stream.
         # Distinct from `self.diary` (vault markdown CRUD) and `self.chat`
@@ -477,6 +479,16 @@ class PushHandler(BaseHTTPRequestHandler):
         if not self.state.shared_secret:
             return True
         token = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
+        if not token:
+            # Fallback for browsers (esp. iOS Safari) that fail on custom-header
+            # preflight: accept ?token=... in URL query. Same security level
+            # (token is the secret either way) but bypasses CORS preflight.
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                token = qs.get("token", [""])[0]
+            except Exception:
+                pass
         return token == self.state.shared_secret
 
     def _require_auth(self) -> bool:
@@ -498,7 +510,7 @@ class PushHandler(BaseHTTPRequestHandler):
         return self._require_auth()
 
     def _is_public_get(self) -> bool:
-        return self.path in {"/health", "/version"}
+        return self.path in {"/health", "/version", "/claude-md"}
 
     def _check_ip_allowed(self) -> bool:
         allowed = self.state.allowed_ips
@@ -529,10 +541,26 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        # CORS — needed because Safari preflights fetch() calls carrying custom
+        # headers (X-Auth-Token) even on same-origin in some edge cases.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-Auth")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
         self.wfile.write(data)
 
     # ---------- routes ----------
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight. Always 204 with permissive headers — auth is
+        enforced on the actual GET/POST, so preflight doesn't need to gate."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-Auth")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         if not self._is_public_get() and not self._check_ip_allowed():
@@ -550,6 +578,17 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
+            return
+        if self.path == "/chat/streaming":
+            self._handle_chat_streaming()
+            return
+        if self.path == "/heartbeat/status":
+            hb = getattr(self.state, "heartbeat", None)
+            self._send_json(200, {"ok": True, "heartbeat": hb.snapshot() if hb else None})
+            return
+        if self.path == "/heartbeat/config":
+            hb = getattr(self.state, "heartbeat", None)
+            self._send_json(200, {"ok": True, "config": hb.config if hb else None})
             return
         if self.path == "/pet/state":
             self._handle_pet_state_get()
@@ -782,6 +821,23 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/health/latest":
             self._handle_health_latest()
             return
+        # Strip ?token=... query to allow query-param auth bypass for Safari
+        _bare_path = self.path.split("?", 1)[0]
+        if _bare_path == "/claude-md":
+            self._handle_claude_md_page()
+            return
+        if _bare_path == "/claude-md/file":
+            self._handle_claude_md_read()
+            return
+        if _bare_path == "/claude-md/backups":
+            self._handle_claude_md_backups()
+            return
+        if self.path.startswith("/memory/list"):
+            self._handle_memory_list()
+            return
+        if self.path.startswith("/memory/search"):
+            self._handle_memory_search()
+            return
         if self.path == "/version":
             self._send_json(200, {"ok": True, "version": self.server_version})
             return
@@ -926,12 +982,22 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_task_append_ephemeral(body)
         elif self.path == "/chat/send":
             self._handle_chat_send(body)
+        elif self.path == "/chat/interrupt":
+            self._handle_chat_interrupt()
         elif self.path == "/chat/regenerate":
             # P0-2: regenerate involves tmux Escape injection — remote control gate
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_regenerate(body)
+        elif self.path == "/heartbeat/config":
+            hb = getattr(self.state, "heartbeat", None)
+            if hb:
+                hb.config.update(body)
+                hb.save()
+                self._send_json(200, {"ok": True, "config": hb.config})
+            else:
+                self._send_json(503, {"error": "heartbeat not initialized"})
         elif self.path == "/pet/state":
             self._handle_pet_state_post(body)
         elif self.path == "/pet/bubble":
@@ -1038,6 +1104,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/health/report":
             self._handle_health_report(body)
+            return
+        elif self.path.split("?", 1)[0] == "/claude-md/file":
+            self._handle_claude_md_write(body)
             return
         elif self.path == "/settings":
             for k, v in body.items():
@@ -2578,6 +2647,50 @@ class PushHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html)
 
+    def _handle_chat_streaming(self):
+        """GET /chat/streaming — return partial assistant output from tmux while typing."""
+        ts = self.state.typing_state
+        if not ts.get("is_typing"):
+            self._send_json(200, {"ok": True, "is_typing": False, "partial": None})
+            return
+        session = self.state.active_session or "opia"
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", session, "-p", "-S", "-60"],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode != 0:
+                self._send_json(200, {"ok": True, "is_typing": True, "partial": None})
+                return
+            raw = result.stdout
+            lines = raw.split("\n")
+            partial_lines = []
+            collecting = False
+            for line in reversed(lines):
+                stripped = line.strip()
+                if not stripped:
+                    if collecting:
+                        break
+                    continue
+                if stripped.startswith("❯") or stripped.startswith("$") or stripped.startswith(">"):
+                    break
+                if "for shortcuts" in stripped or "for agents" in stripped:
+                    break
+                collecting = True
+                partial_lines.append(line)
+            partial_lines.reverse()
+            partial = "\n".join(partial_lines).strip()
+            if len(partial) < 3:
+                partial = None
+            self._send_json(200, {
+                "ok": True,
+                "is_typing": True,
+                "partial": partial,
+                "since": ts.get("since"),
+            })
+        except Exception as e:
+            self._send_json(200, {"ok": True, "is_typing": True, "partial": None})
+
     def _handle_chat_history(self):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
@@ -2948,6 +3061,45 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _handle_slash_usage(self):
+        """在 app 端拦截 /usage，调 ccusage 返回额度信息"""
+        import subprocess as _sp
+        try:
+            r = _sp.run(["ccusage", "json"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                import json as _json
+                data = _json.loads(r.stdout)
+                plan = data.get("plan", "unknown")
+                def _bar(pct):
+                    f = round(pct / 10)
+                    return "█" * f + "░" * (10 - f)
+                def _resets(iso):
+                    if not iso: return "?"
+                    from datetime import datetime, timezone
+                    try:
+                        t = datetime.fromisoformat(iso)
+                        delta = t - datetime.now(timezone.utc)
+                        h = int(delta.total_seconds() // 3600)
+                        m = int((delta.total_seconds() % 3600) // 60)
+                        return f"{h}h{m}m" if h > 0 else f"{m}m"
+                    except Exception:
+                        return iso
+                lines = [f"📊 Plan: {plan}"]
+                for key, label in [("5h", "5h Session"), ("7d", "7d All"), ("7d_sonnet", "7d Sonnet")]:
+                    b = data.get(key)
+                    if not b: continue
+                    pct = b.get("pct", 0)
+                    resets = _resets(b.get("resets_at"))
+                    lines.append(f"{label}: {_bar(pct)} {pct}%  ⏱{resets}")
+                reply_text = "\n".join(lines)
+            else:
+                r2 = _sp.run(["ccusage", "status"], capture_output=True, text=True, timeout=10)
+                reply_text = r2.stdout.strip() if r2.stdout.strip() else "ccusage failed"
+        except Exception as e:
+            reply_text = f"❌ {e}"
+        rec = self.state.chat.append(role="assistant", text=reply_text, source="ios-app")
+        self._send_json(200, {"ok": True, "record": rec})
+
     def _handle_chat_send(self, body: dict[str, Any]):
         """iPhone 发消息进来 → 写 user 条 + 调 bus_send.py 注入主 session"""
         text = body.get("text", "").strip()
@@ -2956,6 +3108,8 @@ class PushHandler(BaseHTTPRequestHandler):
         if not text and not location:
             self._send_json(400, {"error": "text or location required"})
             return
+        if text.strip().lower() == "/usage":
+            return self._handle_slash_usage()
         # 写 user 历史
         rec = self.state.chat.append(
             role="user",
@@ -2987,15 +3141,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     injected = f"{injected}\n{text}"
         # set typing — Cc 收到 message 在 thinking
         self.state.typing_state = {"is_typing": True, "since": rec["ts"]}
-        # 注入文本到 active tmux session
-        # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
-        # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
-        # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
-        target_session = (self.state.active_session or "opia").strip()
+        # 注入文本到 chat 专用 tmux session（独立于 Terminal 的 active_session）
+        target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
-            # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
-            # 给客户端 不再 silent 200 — 否则 ccc app 显示发送成功但 chain 根本收不到.
             self._send_json(502, {
                 "ok": False,
                 "error": f"inject to tmux session '{target_session}' failed: {err}",
@@ -3003,6 +3152,21 @@ class PushHandler(BaseHTTPRequestHandler):
             })
             return
         self._send_json(200, {"ok": True, "record": rec})
+
+    def _handle_chat_interrupt(self):
+        """POST /chat/interrupt — send Escape to chat session to stop generation."""
+        target = (self.state.chat_session or self.state.active_session or "opia").strip()
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "Escape"],
+                capture_output=True, text=True, timeout=3,
+            )
+            self.state.typing_state = {"is_typing": False, "since": ""}
+            logger.info("chat/interrupt: sent Escape to session=%s", target)
+            self._send_json(200, {"ok": True, "session": target})
+        except Exception as e:
+            logger.warning("chat/interrupt failed: %s", e)
+            self._send_json(502, {"ok": False, "error": str(e)})
 
     def _inject_to_session(self, session: str, text: str, source: str = "ios-app", sender: str = "iphone"):
         """Inject text into target tmux session. Returns (success, error_msg).
@@ -3085,6 +3249,140 @@ class PushHandler(BaseHTTPRequestHandler):
         """GET /pet/state — 当前 latest 状态."""
         self._send_json(200, {"ok": True, "latest": self.state.pet.latest()})
 
+    # ---------- CLAUDE.md editor ----------
+
+    _CLAUDE_MD_FILE = Path("/root/ember/CLAUDE.md")
+    _CLAUDE_MD_BACKUP_DIR = Path("/root/ember/.claude-md-backups")
+    _CLAUDE_MD_EDITOR_HTML = Path("/root/ember-ops/claude-md-editor.html")
+    _CLAUDE_MD_MAX_BACKUPS = 30
+    _CLAUDE_MD_MIN_BYTES = 200  # refuse to save anything suspiciously small
+
+    def _handle_claude_md_page(self):
+        """GET /claude-md — serve the editor HTML (no auth on page itself,
+        but content/save API requires auth)."""
+        f = self._CLAUDE_MD_EDITOR_HTML
+        if not f.exists():
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"editor html missing")
+            return
+        body = f.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_claude_md_read(self):
+        """GET /claude-md/file — return current CLAUDE.md content + meta."""
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        f = self._CLAUDE_MD_FILE
+        if not f.exists():
+            self._send_json(404, {"error": "CLAUDE.md not found", "path": str(f)})
+            return
+        try:
+            content = f.read_text(encoding="utf-8")
+            st = f.stat()
+            self._send_json(200, {
+                "ok": True,
+                "path": str(f),
+                "content": content,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "mtime_iso": __import__("time").strftime("%Y-%m-%dT%H:%M:%S", __import__("time").localtime(st.st_mtime)),
+            })
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_claude_md_write(self, body: dict[str, Any]):
+        """POST /claude-md/file — write new content with timestamped backup.
+
+        Body: {"content": "<full new file content>", "expected_mtime": <float?>}
+        - expected_mtime: optional — if provided, refuse if file mtime changed
+          since (prevents lost-update from concurrent edits)."""
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        content = body.get("content")
+        if not isinstance(content, str):
+            self._send_json(400, {"error": "content must be a string"})
+            return
+        if len(content.encode("utf-8")) < self._CLAUDE_MD_MIN_BYTES:
+            self._send_json(400, {"error": f"content too short (<{self._CLAUDE_MD_MIN_BYTES} bytes)"})
+            return
+        f = self._CLAUDE_MD_FILE
+        if not f.exists():
+            self._send_json(404, {"error": "CLAUDE.md not found"})
+            return
+        # Optimistic concurrency check
+        expected_mtime = body.get("expected_mtime")
+        if expected_mtime is not None:
+            try:
+                cur = f.stat().st_mtime
+                if abs(cur - float(expected_mtime)) > 0.5:
+                    self._send_json(409, {
+                        "error": "file changed since you loaded it",
+                        "current_mtime": cur,
+                        "expected_mtime": float(expected_mtime),
+                    })
+                    return
+            except Exception:
+                pass
+        # Backup current
+        try:
+            self._CLAUDE_MD_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            ts_tag = __import__("time").strftime("%Y%m%d_%H%M%S")
+            backup_path = self._CLAUDE_MD_BACKUP_DIR / f"CLAUDE.{ts_tag}.md"
+            backup_path.write_bytes(f.read_bytes())
+            # Trim old backups
+            backups = sorted(self._CLAUDE_MD_BACKUP_DIR.glob("CLAUDE.*.md"))
+            for old in backups[:-self._CLAUDE_MD_MAX_BACKUPS]:
+                try: old.unlink()
+                except Exception: pass
+        except Exception as e:
+            self._send_json(500, {"error": f"backup failed: {e}"})
+            return
+        # Atomic write via temp + rename
+        try:
+            tmp = f.with_suffix(".md.tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(f)
+            st = f.stat()
+            self._send_json(200, {
+                "ok": True,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "backup": backup_path.name,
+            })
+        except Exception as e:
+            self._send_json(500, {"error": f"write failed: {e}"})
+
+    def _handle_claude_md_backups(self):
+        """GET /claude-md/backups — list recent backups."""
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        if not self._CLAUDE_MD_BACKUP_DIR.exists():
+            self._send_json(200, {"ok": True, "backups": []})
+            return
+        backups = []
+        for p in sorted(self._CLAUDE_MD_BACKUP_DIR.glob("CLAUDE.*.md"), reverse=True)[:50]:
+            try:
+                st = p.stat()
+                backups.append({
+                    "name": p.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "mtime_iso": __import__("time").strftime("%Y-%m-%dT%H:%M:%S", __import__("time").localtime(st.st_mtime)),
+                })
+            except Exception:
+                continue
+        self._send_json(200, {"ok": True, "backups": backups})
+
     # ---------- health monitoring ----------
 
     _HEALTH_FILE = Path.home() / ".ots" / "health_reports.jsonl"
@@ -3104,6 +3402,8 @@ class PushHandler(BaseHTTPRequestHandler):
         logger.info("health report saved: steps=%s hr=%s sleep=%s",
                      data.get("steps"), data.get("heart_rate"), data.get("sleep_hours"))
         self._send_json(200, {"ok": True})
+        # walkie-talkie 健康通知 2026-05-24 移除——/api/e2e 已废弃，
+        # 健康数据现在通过 anniversary-context hook 直接注入到 Ember context。
 
     def _handle_health_latest(self):
         """GET /health/latest — return most recent health report."""
@@ -3127,6 +3427,52 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             report = None
         self._send_json(200, {"ok": True, "report": report})
+
+    # ---------- memory library (proxy to ember-home worker) ----------
+
+    _EMBER_HOME_BASE = "https://ember-home.oyanyano66.workers.dev"
+
+    def _handle_memory_list(self):
+        """GET /memory/list?limit=20&category=xxx — proxy to ember-home."""
+        from urllib.parse import urlparse, parse_qs
+        import urllib.request
+        qs = parse_qs(urlparse(self.path).query)
+        limit = qs.get("limit", ["20"])[0]
+        category = qs.get("category", [""])[0]
+        tag = qs.get("tag", [""])[0]
+        url = f"{self._EMBER_HOME_BASE}/api/memory?limit={limit}"
+        if category:
+            url += f"&category={category}"
+        if tag:
+            url += f"&tag={tag}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "CcCompanion/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            self._send_json(200, {"ok": True, **data})
+        except Exception as e:
+            logger.warning("memory list proxy error: %s", e)
+            self._send_json(502, {"error": f"upstream: {e}"})
+
+    def _handle_memory_search(self):
+        """GET /memory/search?q=xxx&limit=10 — proxy to ember-home semantic search."""
+        from urllib.parse import urlparse, parse_qs, quote
+        import urllib.request
+        qs = parse_qs(urlparse(self.path).query)
+        q = qs.get("q", [""])[0]
+        limit = qs.get("limit", ["10"])[0]
+        if not q:
+            self._send_json(400, {"error": "q required"})
+            return
+        url = f"{self._EMBER_HOME_BASE}/api/memory/search?q={quote(q)}&limit={limit}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "CcCompanion/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            self._send_json(200, {"ok": True, **data})
+        except Exception as e:
+            logger.warning("memory search proxy error: %s", e)
+            self._send_json(502, {"error": f"upstream: {e}"})
 
     def _handle_pet_state_post(self, body: dict[str, Any]):
         """POST /pet/state — chain hook 上报状态. body: {state, reason?, ts?}.
@@ -3356,9 +3702,8 @@ class PushHandler(BaseHTTPRequestHandler):
         # set typing
         self.state.typing_state = {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")}
 
-        # 注入 regenerate 文本到 active session — 走 _inject_to_session helper
-        # ccc 公开用户没 ~/scripts/bus_send.py 时 fallback 直接 tmux 注入
-        target_session = (self.state.active_session or "opia").strip()
+        # 注入 regenerate 文本到 chat session
+        target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
             self._send_json(502, {
@@ -3701,9 +4046,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 hint = hint + " " + text
             if rec.get("quoted_text"):
                 hint = f"[引用 \"{rec['quoted_text']}\"]\n" + hint
-            # 给主 session 一条 hint 让 chain 读 file (mac mini 内可读 stored_path)
+            # 给 chat session 一条 hint 让 chain 读 file
             hint += f"\n本地路径: {stored_path}"
-            target_session = (self.state.active_session or "opia").strip()
+            target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
             ok, err = self._inject_to_session(target_session, hint, source="ios-app", sender="iphone")
             if not ok:
                 # 附件已存盘 + 历史已 append 但 chain 注入失败 — 502 surface
@@ -4340,11 +4685,25 @@ def run_server(state: ServerState):
         raise SystemExit(1)
     PushHandler.state = state
     server = ThreadingHTTPServer((state.host, state.port), PushHandler)
-    logger.info("listening on http://%s:%d", state.host, state.port)
+    cert_path = Path(__file__).parent / "cert.pem"
+    key_path = Path(__file__).parent / "key.pem"
+    if cert_path.exists() and key_path.exists():
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert_path), str(key_path))
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        logger.info("listening on https://%s:%d (TLS)", state.host, state.port)
+    else:
+        logger.info("listening on http://%s:%d", state.host, state.port)
     cleanup_thread = threading.Thread(
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
+    from heartbeat import heartbeat_loop
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop, args=(state,), daemon=True, name="heartbeat"
+    )
+    heartbeat_thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
