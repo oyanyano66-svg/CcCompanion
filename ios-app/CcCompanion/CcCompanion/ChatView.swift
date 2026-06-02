@@ -5289,7 +5289,7 @@ struct ChatBubble: View {
                                 // 长按. 之前 List 时代 row-level 长按优先于 inner text 选词, LazyVStack 没这条
                                 // magic 所以 inner 选词菜单覆盖了外层. 这次以外层菜单为准, 失去单词级选择能力,
                                 // 通过外层"复制本条"补全复制路径, 翻译走外层 (下面 row contextMenu 增加).
-                                Text(s)
+                                Text(renderMarkdown(s))
                                     .font(.ccSerifAdaptive(size: chatBodySize))
                                     .foregroundStyle(message.isUser ? Color.ccUserText : Color.ccAssistantText)
                                     .lineLimit(nil)
