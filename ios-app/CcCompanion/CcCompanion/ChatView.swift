@@ -319,6 +319,10 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     let audioJa: String?
     let location: ChatLocation?
     let metadata: ChatMetadata?
+    // Phase 3 (thinking-stream-render): server 给 assistant ios_reply 生成的 turn_id.
+    // iOS 用它向 GET /v1/thinking?turn_id=<id> 拉对应 thinking 文本, 对齐到这条 reply.
+    // 非 assistant / 旧记录为 nil. 不进 GRDB (transient, 实时 poll 带来).
+    var turnId: String? = nil
     // 2026-05-12 optimistic-send sort-fix: `ts` now holds the real ISO send
     // timestamp (so failed bubbles sort chronologically alongside server records
     // instead of permanently gluing to the bottom via `local-` lex tail).
@@ -338,6 +342,7 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         case audioJa = "audio_ja"
         case location
         case metadata
+        case turnId = "turn_id"
         case localId = "local_id"
     }
 
@@ -497,6 +502,38 @@ actor ChatNetworkClient {
         let decoded = try? JSONDecoder().decode(ChatViewModel.ChatSendResponse.self, from: data)
         return decoded?.record
     }
+
+    // Phase 3 (thinking-stream-render): 按 turn_id 拉 thinking 文本.
+    // server GET /v1/thinking?turn_id=<id>&limit=<n> 返回 records (phase 1 已上线).
+    // 同一 turn 可能多条 thinking record, 按 created_at 顺序拼接.
+    func fetchThinking(turnId: String, limit: Int = 50) async -> String? {
+        let url = CcServerConfig.serverURL.appendingPathComponent("v1/thinking")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "turn_id", value: turnId),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        guard let finalURL = components?.url else { return nil }
+        var request = CcServerConfig.authenticatedRequest(url: finalURL)
+        request.timeoutInterval = 20
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(ThinkingFetchResponse.self, from: data)
+        else { return nil }
+        let joined = decoded.records
+            .map { $0.thinking }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
+        return joined.isEmpty ? nil : joined
+    }
+
+    private struct ThinkingFetchResponse: Codable {
+        let records: [ThinkingRecord]
+    }
+    private struct ThinkingRecord: Codable {
+        let turn_id: String?
+        let thinking: String
+    }
 }
 
 struct ToolStack: Identifiable, Hashable {
@@ -601,6 +638,23 @@ final class ChatViewModel: ObservableObject {
     @Published var hasMoreEarlier: Bool = true
     @Published var uploadQueue: [PendingUpload] = []
     @Published private(set) var displayedRowsCache: [ChatRowItem] = []
+    // Phase 3 (thinking-stream-render): turn_id → 拉到的 thinking 文本. ThinkingChip 读这里.
+    @Published private(set) var thinkingByTurn: [String: String] = [:]
+    // 已"终态"的 turn_id (拿到非空文本, 或退避重试耗尽 give up) — 不再拉.
+    private var thinkingFetchedTurns: Set<String> = []
+    // 正在重试循环中的 turn_id, 防 push + poll 双触发起重复循环.
+    private var thinkingInFlightTurns: Set<String> = []
+    // Phase 3 (build 223): silent push 带 turn_id 到达 → 直接拉 thinking, 不等下一次 chat poll.
+    private var thinkingPushObserver: NSObjectProtocol?
+
+    init() {
+        thinkingPushObserver = NotificationCenter.default.addObserver(
+            forName: .ccThinkingPending, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let tid = note.userInfo?["turn_id"] as? String, !tid.isEmpty else { return }
+            Task { @MainActor in self?.fetchThinkingForTurn(tid) }
+        }
+    }
     @Published private(set) var visibleLimit: Int = 300 { didSet { rebuildDisplayedRowsCache() } }
 
     var connectionStatus: ChatConnectionStatus {
@@ -982,6 +1036,7 @@ final class ChatViewModel: ObservableObject {
                 notifyPollingAssistantMessages(response.chat.newRecords, existingIds: existingIds)
                 reconcileLocalSendState()
                 await refreshRecent()
+                fetchThinkingForNewTurns(response.chat.newRecords)
                 lastError = nil
             } else if let last = response.chat.lastTs, (lastTs ?? "") < last {
                 lastTs = last
@@ -991,6 +1046,54 @@ final class ChatViewModel: ObservableObject {
             pollingFailureCount += 1
             objectWillChange.send()
         }
+    }
+
+    // Phase 3 (thinking-stream-render): 新到的 assistant 记录带 turn_id 的, 异步拉 thinking.
+    // silent push (content-available) 到达后也走 fetchThinkingForTurn, 所以 push / 普通 poll 都覆盖.
+    func fetchThinkingForNewTurns(_ records: [ChatMessage]) {
+        let turnIds = records.compactMap { rec -> String? in
+            guard rec.role == "assistant", let tid = rec.turnId, !tid.isEmpty else { return nil }
+            return tid
+        }
+        for tid in Set(turnIds) { fetchThinkingForTurn(tid) }
+    }
+
+    // 单 turn 拉 thinking, 带短退避重试. silent push handler 也调这条 (按 payload turn_id, 不依赖 chat record).
+    // build 223 修竞态: chat record 常先于 chain POST thinking 到达, 第一次 GET 会空.
+    // 空结果**不**标 fetched, 1s/2s/5s 退避重试三次再 give up; 拿到非空才永久标 fetched.
+    func fetchThinkingForTurn(_ tid: String) {
+        guard !tid.isEmpty else { return }
+        // 已成功拉到 / 已在重试中 → 不重复起循环.
+        if thinkingByTurn[tid] != nil || thinkingFetchedTurns.contains(tid) || thinkingInFlightTurns.contains(tid) { return }
+        thinkingInFlightTurns.insert(tid)
+        Task { [weak self] in
+            let delays: [UInt64] = [0, 1_000_000_000, 2_000_000_000, 5_000_000_000] // 即刻 + 1s/2s/5s
+            for (i, delay) in delays.enumerated() {
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                if let text = await ChatNetworkClient.shared.fetchThinking(turnId: tid) {
+                    await MainActor.run {
+                        self?.thinkingByTurn[tid] = text
+                        self?.thinkingFetchedTurns.insert(tid)
+                        self?.thinkingInFlightTurns.remove(tid)
+                    }
+                    return
+                }
+                // 空: 最后一次仍空 → give up (标 fetched 停重试), 否则继续退避.
+                if i == delays.count - 1 {
+                    await MainActor.run {
+                        self?.thinkingFetchedTurns.insert(tid)
+                        self?.thinkingInFlightTurns.remove(tid)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 当前显示窗口里, 某 turn_id 第一条 assistant 消息的 ts (用来决定 ThinkingChip 挂哪条上, 一 turn 只挂一次).
+    func isThinkingChipAnchor(_ msg: ChatMessage) -> Bool {
+        guard msg.role == "assistant", let tid = msg.turnId, thinkingByTurn[tid] != nil else { return false }
+        let firstTsForTurn = messages.first(where: { $0.turnId == tid && $0.role == "assistant" })?.ts
+        return firstTsForTurn == msg.ts
     }
 
     private func notifyPollingAssistantMessages(_ records: [ChatMessage], existingIds: Set<String>) {
@@ -3983,7 +4086,12 @@ private struct ChatListView: View {
                     removal: .opacity
                 ))
         case .message(let msg, let showTime):
-            ChatMessageListRow(
+            VStack(alignment: .leading, spacing: 2) {
+                // Phase 2/3 (thinking-stream-render): 该 turn 第一条 assistant 消息且 thinking 已拉到 → 上方挂折叠卡片.
+                if vm.isThinkingChipAnchor(msg), let tid = msg.turnId, let think = vm.thinkingByTurn[tid] {
+                    ThinkingChip(text: think)
+                }
+                ChatMessageListRow(
                 message: msg,
                 showTime: showTime,
                 multiSelectMode: vm.multiSelectMode,
@@ -4020,7 +4128,8 @@ private struct ChatListView: View {
                 sendStatus: vm.sendStatus(forId: msg.id),
                 onRetry: msg.isUser ? { vm.retryFailedSend(id: msg.id) } : nil,
                 onDiscardFailed: msg.isUser ? { vm.discardFailedSend(id: msg.id) } : nil
-            )
+                )
+            }
             .id(msg.id)
             .padding(.vertical, 4)
             .padding(.trailing, 12)
@@ -4344,6 +4453,73 @@ private struct ChatErrorRow: View {
             .foregroundStyle(.red)
             .padding(.horizontal, 12)
             .padding(.vertical, 4)
+    }
+}
+
+// Phase 2 (thinking-stream-render, 方案 C): assistant turn 的 thinking 折叠卡片.
+// 默认折叠 — 一行 italic 灰 "thinking ▸" + 前 40 字预览. tap 展开看完整 thinking, 再 tap 收起.
+// 左侧细 accent 竖条 + dot 做时间轴侧栏感 (方案 C 轻量版), 不重排已有 bubble 布局.
+private struct ThinkingChip: View {
+    let text: String
+    @State private var expanded: Bool = false
+
+    private var preview: String {
+        let oneLine = text.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(oneLine.prefix(40))
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            // 时间轴侧栏 (方案 C): muted dot + 细灰线
+            VStack(spacing: 0) {
+                Circle()
+                    .fill(Color.ccTextDim.opacity(0.55))
+                    .frame(width: 6, height: 6)
+                    .padding(.top, 5)
+                Rectangle()
+                    .fill(Color.ccTextDim.opacity(0.22))
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
+            }
+            .frame(width: 16)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text("thinking")
+                            .font(.ccSerifAdaptive(size: 12))
+                            .italic()
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                        if !expanded {
+                            Text(preview)
+                                .font(.ccSerifAdaptive(size: 12))
+                                .italic()
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    }
+                    .foregroundStyle(Color.ccTextDim)
+
+                    if expanded {
+                        Text(text)
+                            .font(.ccSerifAdaptive(size: 13))
+                            .foregroundStyle(Color.ccTextDim)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(Color.ccCard.opacity(0.6))
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 0)
+        }
+        .padding(.trailing, 12)
     }
 }
 

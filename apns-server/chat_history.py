@@ -80,6 +80,7 @@ class ChatHistory:
         attachment_filename: str | None = None,
         location: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
         rec: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
@@ -90,6 +91,8 @@ class ChatHistory:
             "audio_en": None,
             "audio_ja": None,
         }
+        if turn_id:
+            rec["turn_id"] = turn_id
         if quoted_ts:
             rec["quoted_ts"] = quoted_ts
             quoted_text = self._lookup_text(quoted_ts)
