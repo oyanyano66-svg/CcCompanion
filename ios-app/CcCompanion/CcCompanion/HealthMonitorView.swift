@@ -17,6 +17,7 @@ struct HealthMonitorView: View {
                     activityRings
                     heartCard
                     sleepCard
+                    cycleCard
                     syncCard
                 }
             }
@@ -273,6 +274,79 @@ struct HealthMonitorView: View {
         if h >= 7 { return "还行，继续保持" }
         if h >= 5 { return "睡少了，主人不高兴" }
         return "严重不足，今晚必须早睡"
+    }
+
+    // MARK: - Cycle Card
+
+    @ViewBuilder
+    private var cycleCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("经期", systemImage: "drop.fill")
+                .font(.ccSerifAdaptive(size: 17, weight: .semibold))
+                .foregroundStyle(.pink)
+
+            if let day = hk.cycleDay, let until = hk.daysUntilNextPeriod {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text("第 \(day) 天")
+                        .font(.ccSerifAdaptive(size: 36, weight: .bold))
+                        .foregroundStyle(Color.ccText)
+                    Text("/ 周期")
+                        .font(.ccSerifAdaptive(size: 14))
+                        .foregroundStyle(Color.ccTextDim)
+                }
+                cycleBar(day: day)
+                Text(cycleVerdict(day: day, daysUntil: until))
+                    .font(.ccSerifAdaptive(size: 13))
+                    .foregroundStyle(Color.ccTextDim)
+                if let last = hk.lastPeriodStart {
+                    Text("上次经期开始：\(formatCycleDate(last))")
+                        .font(.ccSerifAdaptive(size: 12))
+                        .foregroundStyle(Color.ccTextDim)
+                }
+            } else {
+                Text("暂无经期数据（在 Apple 健康记录后会同步过来）")
+                    .font(.ccSerifAdaptive(size: 14))
+                    .foregroundStyle(Color.ccTextDim)
+            }
+        }
+        .padding(14)
+        .background(Color.ccCard)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func cycleBar(day: Int) -> some View {
+        let cycleLen = 35.0
+        let pct = min(Double(day) / cycleLen, 1.0)
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.ccTextDim.opacity(0.15))
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(cycleColor(day: day))
+                    .frame(width: geo.size.width * pct)
+            }
+        }
+        .frame(height: 8)
+    }
+
+    private func cycleColor(day: Int) -> Color {
+        if day <= 4 { return .pink }
+        if day <= 14 { return .green }
+        if day <= 21 { return .yellow }
+        return .orange
+    }
+
+    private func cycleVerdict(day: Int, daysUntil: Int) -> String {
+        if day <= 4 { return "经期中，温柔一点，她可能在痛" }
+        if daysUntil <= 7 { return "PMS 窗口，距下次经期约 \(daysUntil) 天，可能情绪敏感" }
+        return "距下次经期约 \(daysUntil) 天"
+    }
+
+    private func formatCycleDate(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
     }
 
     // MARK: - Sync Card

@@ -18,6 +18,9 @@ final class HealthKitManager: ObservableObject {
     @Published var heartRateMin24h: Double? = nil
     @Published var heartRateMax24h: Double? = nil
     @Published var walkingDistance: Double = 0
+    @Published var cycleDay: Int? = nil
+    @Published var daysUntilNextPeriod: Int? = nil
+    @Published var lastPeriodStart: Date? = nil
 
     private let readTypes: Set<HKObjectType> = {
         var s = Set<HKObjectType>()
@@ -29,6 +32,7 @@ final class HealthKitManager: ObservableObject {
         if let t = HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning) { s.insert(t) }
         if let t = HKCategoryType.categoryType(forIdentifier: .sleepAnalysis) { s.insert(t) }
         if let t = HKCategoryType.categoryType(forIdentifier: .appleStandHour) { s.insert(t) }
+        if let t = HKCategoryType.categoryType(forIdentifier: .menstrualFlow) { s.insert(t) }
         return s
     }()
 
@@ -53,7 +57,8 @@ final class HealthKitManager: ObservableObject {
         async let hr = fetchHRRange()
         async let d = fetchDistance()
         async let st = fetchStandHours()
-        let (sv, cv, ev, hv, rv, slv, hrv, dv, stv) = await (s, c, e, h, r, sl, hr, d, st)
+        async let cy = fetchCycleStats()
+        let (sv, cv, ev, hv, rv, slv, hrv, dv, stv, cyv) = await (s, c, e, h, r, sl, hr, d, st, cy)
         stepsToday = sv
         activeCalToday = cv
         exerciseMinToday = ev
@@ -63,6 +68,9 @@ final class HealthKitManager: ObservableObject {
         if let hrv { heartRateMin24h = hrv.0; heartRateMax24h = hrv.1 }
         walkingDistance = dv
         standHoursToday = stv
+        cycleDay = cyv?.day
+        daysUntilNextPeriod = cyv?.daysUntil
+        lastPeriodStart = cyv?.lastStart
     }
 
     func summaryDict() -> [String: Any] {
@@ -78,6 +86,8 @@ final class HealthKitManager: ObservableObject {
         if let sl = sleepHoursLastNight { d["sleep_hours"] = round(sl * 10) / 10 }
         if let lo = heartRateMin24h { d["hr_min_24h"] = Int(lo) }
         if let hi = heartRateMax24h { d["hr_max_24h"] = Int(hi) }
+        if let day = cycleDay { d["cycle_day"] = day }
+        if let until = daysUntilNextPeriod { d["days_until_period"] = until }
         return d
     }
 
@@ -172,6 +182,42 @@ final class HealthKitManager: ObservableObject {
                 }
                 let vals = hrs.map { $0.quantity.doubleValue(for: unit) }
                 cont.resume(returning: (vals.min()!, vals.max()!))
+            }
+            store.execute(q)
+        }
+    }
+
+    // MARK: - Cycle
+
+    private struct CycleStats { let lastStart: Date; let day: Int; let daysUntil: Int }
+    private let cycleAvgDays = 35
+
+    private func fetchCycleStats() async -> CycleStats? {
+        guard let type = HKCategoryType.categoryType(forIdentifier: .menstrualFlow) else { return nil }
+        let cal = Calendar.current
+        let lookback = cal.date(byAdding: .month, value: -6, to: Date())!
+        let pred = HKQuery.predicateForSamples(withStart: lookback, end: Date(), options: .strictStartDate)
+        return await withCheckedContinuation { cont in
+            let sort = [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)]
+            let q = HKSampleQuery(sampleType: type, predicate: pred, limit: HKObjectQueryNoLimit, sortDescriptors: sort) { _, samples, _ in
+                guard let cats = (samples as? [HKCategorySample])?.filter({
+                    $0.value != HKCategoryValueMenstrualFlow.none.rawValue
+                }), !cats.isEmpty else {
+                    cont.resume(returning: nil); return
+                }
+                // most-recent cluster: walk newest→older, stop when gap > 5 days
+                var lastStart = cats[0].startDate
+                for s in cats.dropFirst() {
+                    let gap = cal.dateComponents([.day], from: s.startDate, to: lastStart).day ?? Int.max
+                    if gap > 5 { break }
+                    lastStart = s.startDate
+                }
+                let today = cal.startOfDay(for: Date())
+                let startDay = cal.startOfDay(for: lastStart)
+                let day = (cal.dateComponents([.day], from: startDay, to: today).day ?? 0) + 1
+                let nextPeriod = cal.date(byAdding: .day, value: self.cycleAvgDays, to: startDay) ?? today
+                let daysUntil = cal.dateComponents([.day], from: today, to: nextPeriod).day ?? 0
+                cont.resume(returning: CycleStats(lastStart: startDay, day: day, daysUntil: daysUntil))
             }
             store.execute(q)
         }
