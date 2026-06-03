@@ -39,26 +39,26 @@ set -uo pipefail
 
 echo "[$(date +%Y-%m-%d\ %H:%M:%S)] hook invoked pid=$$ TMUX_PANE=${TMUX_PANE:-unset}" >> /tmp/ccc_stop_hook.log
 
-# Only run inside ccc-chat tmux pane — skip for tg-ember and other sessions.
+# Only run inside jinappchat tmux pane — skip for tg-ember and other sessions.
 # Try TMUX_PANE first; if unset (Claude Code >=2.1.146 stopped propagating it),
-# match our ancestor PID against the ccc-chat pane PID.
+# match our ancestor PID against the jinappchat pane PID.
 CURRENT_SESSION=""
 if [ -n "${TMUX_PANE:-}" ]; then
     CURRENT_SESSION=$(tmux display-message -t "$TMUX_PANE" -p '#{session_name}' 2>/dev/null || echo "")
 else
-    CCC_PANE_PID=$(tmux list-panes -t ccc-chat -F '#{pane_pid}' 2>/dev/null | head -1)
+    CCC_PANE_PID=$(tmux list-panes -t jinappchat -F '#{pane_pid}' 2>/dev/null | head -1)
     if [ -n "$CCC_PANE_PID" ]; then
         _pid=$$
         while [ "$_pid" -gt 1 ] 2>/dev/null; do
             if [ "$_pid" = "$CCC_PANE_PID" ]; then
-                CURRENT_SESSION="ccc-chat"
+                CURRENT_SESSION="jinappchat"
                 break
             fi
             _pid=$(awk '{print $4}' /proc/$_pid/stat 2>/dev/null || echo 0)
         done
     fi
 fi
-if [ "$CURRENT_SESSION" != "ccc-chat" ]; then
+if [ "$CURRENT_SESSION" != "jinappchat" ]; then
     exit 0
 fi
 
@@ -96,14 +96,16 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
     exit 0
 fi
 
+# Linux 没 tail -r 用 tac — 提前 detect (新版 Claude Code 走 stdin 路径时不进入下面 else 分支也需要)
+REVERSE_CAT="tail -r"
+if ! tail -r /dev/null 2>/dev/null; then REVERSE_CAT="tac"; fi
+
 # Always extract thinking blocks from transcript (stdin last_assistant_message never includes them)
 # Wait for transcript to flush — hook may fire before the final write
 sleep 1
 THINKING_TEXT=""
 if [ -f "$TRANSCRIPT_PATH" ]; then
-    REVERSE_CAT_T="tail -r"
-    if ! tail -r /dev/null 2>/dev/null; then REVERSE_CAT_T="tac"; fi
-    THINKING_TEXT=$($REVERSE_CAT_T "$TRANSCRIPT_PATH" | python3 -c '
+    THINKING_TEXT=$($REVERSE_CAT "$TRANSCRIPT_PATH" | python3 -c '
 import json, sys
 parts = []
 def is_real_user(obj):
@@ -156,11 +158,6 @@ else
 
     # transcript 是 JSONL 一行一条 message
     # 倒着读 抓自上次 user 以来的所有 assistant text part 然后 join
-    # Linux 没 tail -r 用 tac
-    REVERSE_CAT="tail -r"
-    if ! command -v tail >/dev/null 2>&1 || ! tail -r /dev/null 2>/dev/null; then
-        REVERSE_CAT="tac"
-    fi
     LAST_ASSISTANT=$($REVERSE_CAT "$TRANSCRIPT_PATH" | python3 -c '
 import json, sys
 text_parts = []
@@ -201,6 +198,40 @@ if [ -z "$LAST_ASSISTANT" ]; then
     exit 0
 fi
 
+# 2026-06-03 jinapp 群聊: 检测最近 user 注入是否带 "[群聊 来自 ...]" 前缀
+# 是 → 这次 turn 是回群里的, 改 POST /group/append (sender=ember), 不掉到 1v1 chat tab
+IS_GROUP_REPLY="no"
+LAST_USER_TEXT=$($REVERSE_CAT "$TRANSCRIPT_PATH" 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: obj = json.loads(line)
+    except Exception: continue
+    if obj.get("type") != "user": continue
+    msg = obj.get("message", {})
+    content = msg.get("content")
+    if isinstance(content, str):
+        print(content)
+        break
+    if isinstance(content, list):
+        # 跳过 tool_result, 找真正用户/inject 文本
+        if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+            continue
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                print(c.get("text", ""))
+                break
+            elif isinstance(c, str):
+                print(c)
+                break
+        break
+' 2>/dev/null)
+if echo "$LAST_USER_TEXT" | head -c 200 | grep -q '\[群聊 来自'; then
+    IS_GROUP_REPLY="yes"
+    log "detected group inject — routing reply to /group/append"
+fi
+
 # POST thinking 单独一条 (如果有)
 if [ -n "$THINKING_TEXT" ]; then
     THINK_PAYLOAD=$(THINK_TEXT="$THINKING_TEXT" python3 -c '
@@ -222,8 +253,20 @@ print(json.dumps({
     log "posted thinking (chars=${#THINKING_TEXT})"
 fi
 
-# POST 到 /chat/append
-PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" python3 -c '
+# POST 到 /chat/append 或 /group/append (取决于群聊 / 1v1)
+if [ "$IS_GROUP_REPLY" = "yes" ]; then
+    ENDPOINT="$SERVER_URL/group/append"
+    PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" python3 -c '
+import json, os
+print(json.dumps({
+    "sender_id": "ember",
+    "text": os.environ["ASSISTANT_TEXT"],
+    "message_type": "chat",
+}))
+')
+else
+    ENDPOINT="$SERVER_URL/chat/append"
+    PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" python3 -c '
 import json, os, datetime
 ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 print(json.dumps({
@@ -233,12 +276,13 @@ print(json.dumps({
     "ts": ts,
 }))
 ')
+fi
 
 # retry transient network errors (000/502/503/504), don't retry 401 (auth)
 attempt=0
 while [ $attempt -lt 3 ]; do
     HTTP_CODE=$(curl -s -o /tmp/ccc_stop_hook.curlout -w "%{http_code}" \
-        -X POST "$SERVER_URL/chat/append" \
+        -X POST "$ENDPOINT" \
         -H "Content-Type: application/json" \
         -H "X-Auth-Token: $AUTH_TOKEN" \
         --data "$PAYLOAD" \
@@ -261,9 +305,9 @@ while [ $attempt -lt 3 ]; do
 done
 
 if [ "$HTTP_CODE" = "200" ]; then
-    log "posted to /chat/append ok (chars=${#LAST_ASSISTANT})"
+    log "posted to $ENDPOINT ok (chars=${#LAST_ASSISTANT})"
 else
-    log "POST /chat/append failed http=$HTTP_CODE body=$(cat /tmp/ccc_stop_hook.curlout 2>/dev/null | head -c 200)"
+    log "POST $ENDPOINT failed http=$HTTP_CODE body=$(cat /tmp/ccc_stop_hook.curlout 2>/dev/null | head -c 200)"
 fi
 
 exit 0

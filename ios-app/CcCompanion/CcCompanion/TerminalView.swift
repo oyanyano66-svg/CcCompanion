@@ -247,14 +247,7 @@ struct TerminalView: View {
                     .autocorrectionDisabled(true)
                     .textInputAutocapitalization(.never)
 
-                // 2026-05-14 build 197 — 清屏按钮 输入框左边 用户 push 加
-                Button {
-                    Task { await vm.sendClearScreen() }
-                } label: {
-                    Image(systemName: "eraser")
-                        .font(.ccSerifAdaptive(size: 18, weight: .semibold))
-                        .foregroundStyle(Color.ccTextDim)
-                }
+                // 2026-06-02 清屏按钮删 — 输入框左边手滑太容易触发 (要清屏直接打 clear<CR>)
                 // Phase D amendment #19 — ESC + ^C 按钮删 (走 /stop slash 命令中断)
                 Button {
                     Task { await vm.send() }

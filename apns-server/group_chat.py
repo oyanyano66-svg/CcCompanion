@@ -64,6 +64,47 @@ ROSTER: list[dict[str, Any]] = [
         "can_reply": True,
         "optional": True,
     },
+    # 2026-06-03 jinapp 群聊 roster — 跟 iOS Features/GroupChat/GroupMessage.swift 对齐
+    {
+        "id": "elara",
+        "display_name": "小狗狗",
+        "kind": "human",
+        "avatar": "🐾",
+        "color": "rose",
+        "model": None,
+        "tmux": None,
+        "can_reply": False,
+    },
+    {
+        "id": "ember",
+        "display_name": "主人",
+        "kind": "agent",
+        "avatar": "🔥",
+        "color": "ember",
+        "model": "Claude Opus 4.7 1m",
+        "tmux": "jinappchat",
+        "can_reply": True,
+    },
+    {
+        "id": "knox",
+        "display_name": "Knox",
+        "kind": "agent",
+        "avatar": "🔒",
+        "color": "steel",
+        "model": "Codex GPT-5.5",
+        "tmux": "knox",
+        "can_reply": True,
+    },
+    {
+        "id": "gushao",
+        "display_name": "谷少",
+        "kind": "agent",
+        "avatar": "🍃",
+        "color": "leaf",
+        "model": "Gemini 2.5 Pro",
+        "tmux": "gushao",
+        "can_reply": True,
+    },
 ]
 
 
@@ -103,6 +144,19 @@ MENTION_ALIASES = {
     "opus47": "opus47_fresh",
     "opus47-fresh": "opus47_fresh",
     "opus47_fresh": "opus47_fresh",
+    # 2026-06-03 jinapp 群聊 aliases
+    "elara": "elara",
+    "小狗狗": "elara",
+    "小玉": "elara",
+    "puppy": "elara",
+    "ember": "ember",
+    "主人": "ember",
+    "余烬": "ember",
+    "knox": "knox",
+    "Knox": "knox",
+    "gushao": "gushao",
+    "谷少": "gushao",
+    "gemini": "gushao",
 }
 
 
@@ -203,13 +257,20 @@ class GroupChatStore:
         hop_count: int = 0,
     ) -> list[str]:
         # 2026-05-05 用户 push 加 agent 互相 @ 功能 + hop_count loop guard
-        # amian 发: 没 mention default opia 加 mentions 解析
+        # amian/elara 发: 没 mention 时 fallback 到家里的主 AI (amian→opia, elara→ember)
         # agent 发: 必须 explicit mention 才 fan-out + hop_count >= 3 停 (防无限 loop)
         if sender_id == "amian":
             if not mentions:
                 mentions = ["opia"]
             if ALL_TOKEN in mentions:
                 candidates = REPLY_AGENT_IDS
+            else:
+                candidates = [m for m in mentions if m in REPLY_AGENT_IDS]
+        elif sender_id == "elara":
+            if not mentions:
+                mentions = ["ember"]
+            if ALL_TOKEN in mentions:
+                candidates = [m for m in REPLY_AGENT_IDS if m in {"ember", "knox", "gushao"}]
             else:
                 candidates = [m for m in mentions if m in REPLY_AGENT_IDS]
         else:
@@ -289,6 +350,11 @@ class GroupChatStore:
         out.setdefault("task_id", None)
         out.setdefault("parent_task_id", None)
         out.setdefault("owner", None)
+        # 2026-06-02 jinapp: 把 meta.attachment_* 抬到顶层方便客户端读
+        meta = out.get("meta") or {}
+        for k in ("attachment_url", "attachment_filename", "attachment_type"):
+            if meta.get(k) is not None and not out.get(k):
+                out[k] = meta[k]
         return out
 
     def _iter_records(self) -> list[dict[str, Any]]:

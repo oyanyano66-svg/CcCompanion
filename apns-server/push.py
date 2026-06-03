@@ -86,6 +86,23 @@ logger = logging.getLogger("cc-apns-server")
 
 
 # P0-3: auto-generate and persist shared_secret if not configured
+def _parse_iso_seconds(s: str) -> float | None:
+    """ISO 8601 string → unix seconds (float). Returns None on failure."""
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        d = datetime.fromisoformat(s[:25] + (s[25:] if len(s) > 25 else ""))
+        return d.timestamp()
+    except Exception:
+        try:
+            d = datetime.fromisoformat(s.split("+")[0].split(".")[0])
+            return d.timestamp()
+        except Exception:
+            return None
+
+
 def _load_or_create_secret() -> str:
     """Load existing auto-generated secret or create one. Stored at ~/.ots/secret (mode 0600)."""
     secret_dir = Path.home() / ".ots"
@@ -380,7 +397,7 @@ class ServerState:
             except Exception:
                 pass
         # Chat 专用 session（独立于 Terminal 的 active_session）
-        self.chat_session: str = "ccc-chat"
+        self.chat_session: str = "jinappchat"
         self.diary = Diary(Path("~/Documents/星原/眠的小家/日记/").expanduser())
         # 2026-05-11 OTS Diary tab — chain↔用户 chat-style journaling stream.
         # Distinct from `self.diary` (vault markdown CRUD) and `self.chat`
@@ -711,6 +728,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/chat/status":
             self._handle_chat_status()
             return
+        if self.path == "/chat/model":
+            self._handle_chat_model_get()
+            return
         if self.path == "/settings":
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
             return
@@ -1007,6 +1027,14 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_task_action(body, "clear_history")
         elif self.path == "/task/append-ephemeral":
             self._handle_task_append_ephemeral(body)
+        elif self.path == "/chat/model":
+            self._handle_chat_model_post(body)
+        elif self.path == "/chat/new":
+            self._handle_chat_new_session()
+            return
+        elif self.path == "/chat/forge":
+            self._handle_chat_forge()
+            return
         elif self.path == "/chat/send":
             self._handle_chat_send(body)
         elif self.path == "/chat/interrupt":
@@ -1063,6 +1091,9 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_group_send(body)
         elif self.path == "/group/append":
             self._handle_group_append(body)
+        elif self.path.startswith("/group/upload"):
+            self._handle_group_upload()
+            return
         elif self.path == "/group/dispatch-state":
             self._handle_group_dispatch_state(body)
         elif self.path == "/group/typing":
@@ -1091,6 +1122,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_chat_delete(body)
         elif self.path == "/chat/react":
             self._handle_chat_react(body)
+        elif self.path == "/chat/tts":
+            self._handle_chat_tts(body)
         elif self.path == "/diary/append":
             self._handle_diary_append(body)
         elif self.path == "/timeline/event":
@@ -1548,6 +1581,283 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.exception("diary prompts fail")
             self._send_json(500, {"error": str(e)})
+
+    def _handle_group_upload(self):
+        """POST /group/upload?filename=&sender_id=&text= — raw bytes body"""
+        import uuid as _uuid
+        from urllib.parse import urlparse, parse_qs, unquote
+        qs = parse_qs(urlparse(self.path).query)
+        filename = qs.get("filename", [None])[0] or "upload.bin"
+        sender_id = (qs.get("sender_id", [None])[0] or "elara").strip()
+        text = (qs.get("text", [None])[0] or "").strip()
+        try:
+            filename = unquote(filename)
+        except Exception:
+            pass
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        if length <= 0 or length > 50 * 1024 * 1024:
+            self._send_json(400, {"error": "invalid content-length (max 50MB)"})
+            return
+        ext = Path(filename).suffix.lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+        voice_exts = {".m4a", ".mp3", ".aac", ".wav", ".ogg", ".opus"}
+        atype = "image" if ext in image_exts else ("voice" if ext in voice_exts else "file")
+        stored_name = f"{_uuid.uuid4().hex}{ext}"
+        stored_path = self.state.attachments_dir / stored_name
+        try:
+            with stored_path.open("wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except Exception as e:
+            self._send_json(500, {"error": f"write fail: {e}"})
+            return
+        attachment_url = f"/attachments/{stored_name}"
+        msg_text = text if text else (f"[图片] {filename}" if atype == "image" else (f"[语音] {filename}" if atype == "voice" else f"[文件] {filename}"))
+        try:
+            rec = self.state.group_chat.append(
+                sender_id,
+                msg_text,
+                source="ios-app",
+                meta={
+                    "attachment_url": attachment_url,
+                    "attachment_filename": filename,
+                    "attachment_type": atype,
+                },
+            )
+            self._send_json(200, {"ok": True, "record": rec})
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    # 2026-06-02 jinapp: 给历史消息补 thinking 字段（扫所有 ember jsonl, 模糊时间匹配）
+    _thinking_cache: dict[str, Any] = {}
+
+    def _load_thinking_map(self) -> list[tuple[float, str, float]]:
+        """list of (unix_ts_utc, thinking_text, duration_sec), sorted by ts asc."""
+        try:
+            jsonl_dir = "/root/.claude/projects/-root-ember"
+            if not os.path.isdir(jsonl_dir):
+                return []
+            # 只看最近 14 天的 jsonl
+            cutoff = time.time() - 14 * 86400
+            files = []
+            for fn in os.listdir(jsonl_dir):
+                if not fn.endswith(".jsonl"):
+                    continue
+                p = os.path.join(jsonl_dir, fn)
+                mt = os.path.getmtime(p)
+                if mt < cutoff:
+                    continue
+                files.append((p, mt))
+            files.sort(key=lambda x: x[1])
+            sig = ",".join(f"{p}:{int(mt)}" for p, mt in files)
+            cache = type(self)._thinking_cache
+            if cache.get("sig") == sig:
+                return cache.get("list") or []
+            entries: list[tuple[float, str, float]] = []
+            for path, _ in files:
+                last_thinking: list[str] = []
+                last_thinking_start: float | None = None
+                try:
+                    with open(path) as h:
+                        for line in h:
+                            try:
+                                e = json.loads(line)
+                            except Exception:
+                                continue
+                            if e.get("type") != "assistant":
+                                continue
+                            msg = e.get("message") or {}
+                            c = msg.get("content")
+                            if not isinstance(c, list):
+                                continue
+                            has_text = False
+                            text_ts = e.get("timestamp", "")
+                            for b in c:
+                                if not isinstance(b, dict):
+                                    continue
+                                bt = b.get("type")
+                                if bt == "thinking":
+                                    th = b.get("thinking") or ""
+                                    if th:
+                                        last_thinking.append(th)
+                                        if last_thinking_start is None:
+                                            last_thinking_start = _parse_iso_seconds(text_ts)
+                                elif bt == "text":
+                                    has_text = True
+                            if has_text and last_thinking:
+                                full = "\n\n".join(last_thinking).strip()
+                                end_t = _parse_iso_seconds(text_ts) or 0
+                                dur = max(0.0, end_t - (last_thinking_start or end_t))
+                                entries.append((end_t, full, dur))
+                                last_thinking = []
+                                last_thinking_start = None
+                            elif has_text:
+                                last_thinking = []
+                                last_thinking_start = None
+                except Exception:
+                    continue
+            entries.sort(key=lambda x: x[0])
+            type(self)._thinking_cache = {"sig": sig, "list": entries}
+            return entries
+        except Exception:
+            return []
+
+    def _enrich_history_with_thinking(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        entries = self._load_thinking_map()
+        if not entries:
+            return records
+        # ±120s 模糊匹配 — cc-companion append 可能比 jsonl text 晚 1 分钟
+        for r in records:
+            if r.get("role") != "assistant":
+                continue
+            ts = r.get("ts") or ""
+            t_local = _parse_iso_seconds(ts)
+            if t_local is None:
+                continue
+            # ts already includes timezone, _parse_iso_seconds returns absolute unix time
+            best: tuple[str, float] | None = None
+            best_diff = 120.0
+            for entry_t, th, dur in entries:
+                d = abs(entry_t - t_local)
+                if d < best_diff:
+                    best_diff = d
+                    best = (th, dur)
+                elif entry_t - t_local > best_diff:
+                    break
+            if best:
+                r["thinking"] = best[0]
+                r["thinking_duration_sec"] = best[1]
+        return records
+
+    def _handle_chat_model_get(self):
+        """读 jinappchat tmux session 里跑的 claude 进程的 --model 参数"""
+        try:
+            target = (self.state.chat_session or "jinappchat").strip()
+            pane_pid = subprocess.run(
+                ["tmux", "list-panes", "-t", target, "-F", "#{pane_pid}"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip().splitlines()
+            if not pane_pid:
+                self._send_json(200, {"ok": True, "model": None, "session": target})
+                return
+            claude_pid = subprocess.run(
+                ["pgrep", "-P", pane_pid[0], "claude"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip().splitlines()
+            if not claude_pid:
+                self._send_json(200, {"ok": True, "model": None, "session": target})
+                return
+            args = subprocess.run(
+                ["ps", "-p", claude_pid[0], "-o", "args="],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            import re
+            m = re.search(r"--model\s+(\S+)", args)
+            model = m.group(1) if m else None
+            self._send_json(200, {"ok": True, "model": model, "session": target})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_chat_new_session(self):
+        """POST /chat/new — ccc-switch.sh new 模式 (全新 sid, 无历史)"""
+        if not self.state.allow_remote_control:
+            self._send_json(403, {"error": "remote_control disabled"}); return
+        try:
+            script = "/root/ember-ops/ccc-switch.sh"
+            if not os.path.exists(script):
+                self._send_json(500, {"error": "ccc-switch.sh not found"}); return
+            # 用当前 model
+            try:
+                pane_pid = subprocess.run(["tmux", "list-panes", "-t", "jinappchat", "-F", "#{pane_pid}"], capture_output=True, text=True, timeout=3).stdout.strip().splitlines()[0]
+                claude_pid = subprocess.run(["pgrep", "-P", pane_pid, "claude"], capture_output=True, text=True, timeout=3).stdout.strip().splitlines()[0]
+                args = subprocess.run(["ps", "-p", claude_pid, "-o", "args="], capture_output=True, text=True, timeout=3).stdout
+                import re
+                m = re.search(r"--model\s+(\S+)", args)
+                model = m.group(1) if m else "claude-opus-4-7[1m]"
+            except Exception:
+                model = "claude-opus-4-7[1m]"
+            subprocess.Popen([script, model, "new"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._send_json(200, {"ok": True, "note": "spawning fresh session (detached)"})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_chat_forge(self):
+        """POST /chat/forge — forge-reload 当前 jinappchat sid (压缩历史到 ~100k tokens)"""
+        if not self.state.allow_remote_control:
+            self._send_json(403, {"error": "remote_control disabled"}); return
+        try:
+            sid_file = "/root/ember-ops/jinappchat.sid"
+            if not os.path.exists(sid_file):
+                self._send_json(400, {"error": "jinappchat.sid not found"}); return
+            with open(sid_file) as f: old_sid = f.read().strip()
+            if not old_sid:
+                self._send_json(400, {"error": "empty sid"}); return
+            tdir_path = Path("/root/.claude/projects/-root-ember")
+            import sys as _sys
+            _sys.path.insert(0, "/root/tg-ember")
+            try:
+                from forge_reload import forge as _forge
+            except Exception as e:
+                self._send_json(500, {"error": f"forge_reload import: {e}"}); return
+            try:
+                new_sid = _forge(old_sid, tdir_path, skip_diary=True)
+            except Exception as e:
+                self._send_json(500, {"error": f"forge: {e}"}); return
+            if not new_sid:
+                self._send_json(200, {"ok": True, "note": "forge skipped (under threshold)"}); return
+            with open(sid_file, "w") as f: f.write(new_sid)
+            # 让 ccc-switch.sh keep 重启 (它会读新 state 跑 --resume new_sid)
+            script = "/root/ember-ops/ccc-switch.sh"
+            try:
+                pane_pid = subprocess.run(["tmux", "list-panes", "-t", "jinappchat", "-F", "#{pane_pid}"], capture_output=True, text=True, timeout=3).stdout.strip().splitlines()[0]
+                claude_pid = subprocess.run(["pgrep", "-P", pane_pid, "claude"], capture_output=True, text=True, timeout=3).stdout.strip().splitlines()[0]
+                args = subprocess.run(["ps", "-p", claude_pid, "-o", "args="], capture_output=True, text=True, timeout=3).stdout
+                import re
+                m = re.search(r"--model\s+(\S+)", args)
+                model = m.group(1) if m else "claude-opus-4-7[1m]"
+            except Exception:
+                model = "claude-opus-4-7[1m]"
+            subprocess.Popen([script, model, "keep"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._send_json(200, {"ok": True, "old_sid": old_sid, "new_sid": new_sid, "note": "forged + restarting"})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_chat_model_post(self, body: dict[str, Any]):
+        """POST /chat/model {model: 'claude-opus-4-7[1m]'} — 调 ccc-switch.sh keep"""
+        if not self.state.allow_remote_control:
+            self._send_json(403, {"error": "remote_control disabled"})
+            return
+        model = (body.get("model") or "").strip()
+        ALLOWED = {
+            "claude-opus-4-8[1m]", "claude-opus-4-7[1m]", "claude-opus-4-6[1m]", "claude-opus-4-5[1m]",
+            "claude-sonnet-4-6[1m]", "claude-haiku-4-5",
+        }
+        if model not in ALLOWED:
+            self._send_json(400, {"error": f"model not in allowlist: {model}"})
+            return
+        try:
+            script = "/root/ember-ops/ccc-switch.sh"
+            if not os.path.exists(script):
+                self._send_json(500, {"error": f"ccc-switch.sh not found at {script}"})
+                return
+            subprocess.Popen(
+                [script, model, "keep"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._send_json(200, {"ok": True, "model": model, "note": "switching (detached); next message uses new model"})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
 
     def _handle_chat_status(self):
         """chat 状态栏: typing / online / sleeping
@@ -2435,35 +2745,43 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
             return
         self.state.group_chat.set_typing(sender_id, False)
-        # 2026-05-05 加 fan-out trigger 当 sender 是 agent + mentions 含 agent
+        # 2026-05-05 fan-out: 原先靠 ~/scripts/bus_send.py (这台 VPS 上没有),
+        # 2026-06-03 改成直接走 _inject_to_session(target_tmux) — jinapp 群聊里
+        # elara → ember → tmux jinappchat 的链路终于通了
         if targets:
             dispatch_id = f"dsp_{int(time.time() * 1000)}"
-            context = "\n".join(self.state.group_chat.context_lines(limit=20))
             for agent_id in targets:
                 self.state.group_chat.set_typing(agent_id, True, dispatch_id=dispatch_id)
-            try:
-                subprocess.Popen(
-                    [
-                        "python3",
-                        self.state.bus_send_path,
-                        "--source", "ios-group",
-                        "--sender", sender_id,
-                        "--channel", "group",
-                        "--text", text,
-                        "--message-id", rec["id"],
-                        "--parent-msg-id", str(body.get("parent_msg_id") or ""),
-                        "--mentions", ",".join(mentions),
-                        "--to", ",".join(targets),
-                        "--context", context,
-                        "--hop-count", str(hop_count + 1),
-                        "--inject-only",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                logger.warning("group fan-out fail: %s", e)
-                for agent_id in targets:
+            sender_member = self.state.group_chat.member(sender_id) or {}
+            sender_name = sender_member.get("display_name") or sender_id
+            for agent_id in targets:
+                target_member = self.state.group_chat.member(agent_id) or {}
+                target_tmux = target_member.get("tmux")
+                if not target_tmux:
+                    logger.warning("group fan-out skip: agent %s has no tmux", agent_id)
+                    self.state.group_chat.set_typing(agent_id, False, dispatch_id=dispatch_id)
+                    continue
+                ment_str = (" @" + " @".join(mentions)) if mentions else ""
+                # 不同 agent inject 格式不同:
+                #   ember (Claude Code) — Stop hook 自动路由群聊回复, 只需朴素前缀
+                #   knox/gushao (codex/gemini, 没 Stop hook) — 需要内嵌 curl 指令让 agent 自己 POST
+                if agent_id == "ember":
+                    injected = f"[群聊 来自 {sender_name}{ment_str}] {text}"
+                else:
+                    secret = self.state.shared_secret or ""
+                    injected = (
+                        f"[群聊 来自 {sender_name}{ment_str}] {text}\n\n"
+                        f"---\n"
+                        f"⚠️ 这是群聊消息（不是 1v1）. 回复请用 curl 发到 /group/append, 别只在终端打字:\n"
+                        f"curl -s -X POST http://127.0.0.1:8795/group/append "
+                        f"-H 'X-Auth-Token: {secret}' "
+                        f"-H 'Content-Type: application/json' "
+                        f"-d '{{\"sender_id\":\"{agent_id}\",\"text\":\"<你的回复>\"}}'\n"
+                        f"（{{...}} 里替换成你的话, 转义引号）"
+                    )
+                ok, err = self._inject_to_session(target_tmux, injected, source="ios-group", sender=sender_id)
+                if not ok:
+                    logger.warning("group fan-out inject fail agent=%s tmux=%s err=%s", agent_id, target_tmux, err)
                     self.state.group_chat.set_typing(agent_id, False, dispatch_id=dispatch_id)
         self._send_json(200, {"ok": True, "record": rec, "targets": targets})
 
@@ -2698,7 +3016,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if not ts.get("is_typing"):
             self._send_json(200, {"ok": True, "is_typing": False, "partial": None})
             return
-        session = self.state.active_session or "opia"
+        # 2026-06-03 jinapp: 用 chat_session (jinappchat) 而不是 active_session (终端 tab).
+        # 之前一直拉 opia 没 partial 是因为 chat 跟 terminal 是两个不同 tmux session.
+        session = self.state.chat_session or self.state.active_session or "jinappchat"
         try:
             result = subprocess.run(
                 ["tmux", "capture-pane", "-t", session, "-p", "-S", "-60"],
@@ -2709,22 +3029,74 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             raw = result.stdout
             lines = raw.split("\n")
-            partial_lines = []
-            collecting = False
+            # 2026-06-03 jinapp: 新版 claude UI 结构 (反向扫):
+            #   [status line  ⏵⏵ ...]                       \
+            #   [────────]                                  | 底部 UI (跳过)
+            #   [❯ <empty 或 Press up>]                      |
+            #   [────────]                                  |
+            #   [optional ✻ Brewing/Cogitated for Xs]       /
+            #   <reply content>                              ← 要抓的
+            #   ...
+            #   [❯ [时间戳] 本回合用户输入]                   ← 撞到这就停
+            #   ...上一回合
+            import re as _re
+            # user echo line:  ❯ <text>  (有或无时间戳都算; "❯" 空 / "❯ Press up" 不算)
+            def _is_user_echo(s: str) -> bool:
+                if not s.startswith("❯"):
+                    return False
+                rest = s[1:].lstrip()
+                if not rest:
+                    return False
+                if rest.startswith("Press up"):
+                    return False
+                return True
+            # claude thinking/status indicator — 单个装饰字符 + 大写动词 + ... 或秒数
+            # 已知前缀: ✻ ✢ ✽ ✼ · • + verb (Hashing/Doodling/Cogitated/Brewing/Sautéed/Pondered/...)
+            _thinking_re = _re.compile(
+                r"^[✻✢✽✼·•⏵]\s*[A-Z][a-zA-Zé]+\b",
+                _re.UNICODE,
+            )
+            def _is_thinking_line(s: str) -> bool:
+                if _thinking_re.match(s):
+                    return True
+                if s.startswith("Thought for "):
+                    return True
+                return False
+            def _is_footer(s: str) -> bool:
+                if not s: return True
+                if s.startswith("─"): return True
+                if s.startswith("❯") and not _is_user_echo(s): return True
+                if "⏵⏵" in s: return True
+                if "esc to interrupt" in s: return True
+                if "for shortcuts" in s or "for agents" in s: return True
+                if _is_thinking_line(s): return True
+                if "@ember:" in s and s.endswith("#"): return True
+                if "cannot be used with root" in s: return True
+                if "No such file or directory" in s: return True
+                if "Resume this session with" in s: return True
+                return False
+            partial_lines: list[str] = []
+            state = "footer"
             for line in reversed(lines):
                 stripped = line.strip()
-                if not stripped:
-                    if collecting:
-                        break
+                if state == "footer":
+                    if _is_footer(stripped):
+                        continue
+                    state = "reply"
+                    partial_lines.append(line)
                     continue
-                if stripped.startswith("❯") or stripped.startswith("$") or stripped.startswith(">"):
+                # state == "reply"
+                if _is_user_echo(stripped):
                     break
-                if "for shortcuts" in stripped or "for agents" in stripped:
-                    break
-                collecting = True
+                # reply 内部也可能撞到 inline 状态行 (claude 边写边重渲染) — 跳过它们但不停
+                if _is_thinking_line(stripped):
+                    continue
                 partial_lines.append(line)
             partial_lines.reverse()
             partial = "\n".join(partial_lines).strip()
+            # 去开头的 ● bullet (claude reply marker)
+            if partial.startswith("●"):
+                partial = partial[1:].lstrip()
             if len(partial) < 3:
                 partial = None
             self._send_json(200, {
@@ -2759,6 +3131,8 @@ class PushHandler(BaseHTTPRequestHandler):
             chat_records = self.state.chat.read_since(since_ts=since, before_ts=before, limit=limit)
         # task records 走 /chat/poll 不混入持久 history (prevents stale task injection causing scroll-jump)
         records = chat_records
+        # 2026-06-02 jinapp: 给历史消息附加 thinking
+        records = self._enrich_history_with_thinking(records)
         self._send_json(200, {"ok": True, "records": records, "count": len(records)})
 
     def _handle_chat_search(self):
@@ -4047,7 +4421,8 @@ class PushHandler(BaseHTTPRequestHandler):
         # 推断 type
         ext = Path(filename).suffix.lower()
         image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
-        atype = "image" if ext in image_exts else "file"
+        voice_exts = {".m4a", ".mp3", ".aac", ".wav", ".ogg", ".opus"}
+        atype = "image" if ext in image_exts else ("voice" if ext in voice_exts else "file")
 
         # uuid 命名 + 保留 extension
         stored_name = f"{_uuid.uuid4().hex}{ext}"
@@ -4082,7 +4457,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         # 如果是 user 上传 也往主 session 注入一条 hint 让 chain 感知有附件
         if role == "user":
-            hint = f"[用户发了{'图片' if atype == 'image' else '文件'}: {filename}]"
+            hint = f"[用户发了{'图片' if atype == 'image' else ('语音' if atype == 'voice' else '文件')}: {filename}]"
             if rec.get("location"):
                 loc = rec["location"]
                 label = loc.get("label", "")
@@ -4137,11 +4512,47 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json(500, {"error": "read fail"})
             return
-        self.send_response(200)
+        # 2026-06-03 Range support: AVPlayer 在 iOS 上拉 audio 必须能 seek,
+        # 没 Range/206 它算不出 duration 显示 0:00 (狗狗踩坑)
+        range_hdr = self.headers.get("Range", "")
+        start, end = 0, length - 1
+        is_partial = False
+        if range_hdr.startswith("bytes="):
+            try:
+                spec = range_hdr[6:].split(",", 1)[0]
+                s, e = spec.split("-", 1)
+                if s:
+                    start = int(s)
+                if e:
+                    end = min(int(e), length - 1)
+                if start <= end < length:
+                    is_partial = True
+            except Exception:
+                start, end, is_partial = 0, length - 1, False
+        chunk_size = end - start + 1
+        if is_partial:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{length}")
+        else:
+            self.send_response(200)
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Type", mime)
-        self.send_header("Content-Length", str(length))
+        self.send_header("Content-Length", str(chunk_size))
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
+        try:
+            with target.open("rb") as f:
+                f.seek(start)
+                remaining = chunk_size
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+                return
+        except Exception:
+            pass
         try:
             with target.open("rb") as f:
                 while True:
@@ -4170,6 +4581,57 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         ok = self.state.chat.add_reaction(ts, emoji)
         self._send_json(200, {"ok": ok, "ts": ts, "emoji": emoji})
+
+    def _handle_chat_tts(self, body: dict[str, Any]):
+        """POST /chat/tts {ts}: 按需对一条 assistant 消息生成 Minimax TTS.
+        狗狗在 iOS 点 🔊 才触发, 避免每条都付费. 同步生成, 返 audio_zh URL.
+        """
+        ts = body.get("ts", "").strip()
+        if not ts:
+            self._send_json(400, {"error": "ts required"})
+            return
+        # 找消息 (tail 200 条够用了, 找不到说明已被翻过去)
+        target_rec = None
+        for r in self.state.chat.tail(n=200):
+            if r.get("ts") == ts:
+                target_rec = r
+                break
+        if not target_rec:
+            self._send_json(404, {"error": "message not found"})
+            return
+        if target_rec.get("role") != "assistant":
+            self._send_json(400, {"error": "tts only for assistant messages"})
+            return
+        # 已经有 audio_zh? 直接返
+        if target_rec.get("audio_zh"):
+            self._send_json(200, {"ok": True, "audio_zh": target_rec["audio_zh"], "cached": True})
+            return
+        text = (target_rec.get("text") or "").strip()
+        if not text:
+            self._send_json(400, {"error": "empty text"})
+            return
+        # 跳过 💭/📊 头
+        if text.startswith("💭") or text.startswith("📊"):
+            self._send_json(400, {"error": "skip thinking/usage block"})
+            return
+        # 同步生成 (狗狗在 iOS 等着, 给个 loading 体验)
+        try:
+            result = TTS.generate(text, self.state.attachments_dir, lang="zh")
+        except Exception as e:
+            logger.exception("on-demand tts fail")
+            self._send_json(500, {"error": f"tts gen fail: {e}"})
+            return
+        if not result:
+            self._send_json(502, {"error": "tts returned no audio (check minimax key/group/voice config)"})
+            return
+        fname, _ = result
+        audio_url = f"/attachments/{fname}"
+        ok = self.state.chat.update_audio(ts=ts, audio_zh=audio_url)
+        if not ok:
+            self._send_json(500, {"error": "update_audio failed"})
+            return
+        logger.info("on-demand tts ok ts=%s url=%s", ts, audio_url)
+        self._send_json(200, {"ok": True, "audio_zh": audio_url, "cached": False})
 
     def _handle_todos_toggle(self, body: dict[str, Any]):
         if not self._check_auth():
@@ -4429,13 +4891,19 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- tmux 终端 endpoints ----------
 
+    # 2026-05-25: iOS terminal tab only shows sessions in this whitelist.
+    # Other sessions (tg, jinappchat, jin, etc.) keep running but aren't shown
+    # in the iOS picker, so the user sees a clean two-session list.
+    _TMUX_SESSION_WHITELIST = {"cc", "knox"}
+
     def _handle_tmux_sessions(self):
         try:
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}"],
                 capture_output=True, text=True, timeout=3
             )
-            sessions = [s.strip() for s in result.stdout.split("\n") if s.strip()]
+            all_sessions = [s.strip() for s in result.stdout.split("\n") if s.strip()]
+            sessions = [s for s in all_sessions if s in self._TMUX_SESSION_WHITELIST]
             self._send_json(200, {"ok": True, "sessions": sessions})
         except Exception as e:
             self._send_json(500, {"error": str(e)})
@@ -4466,16 +4934,18 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_tmux_send(self, body: dict[str, Any]):
         keys = body.get("keys", "")
-        # 兜底 body 没传 session 时走当前 active_session 而不是写死 opia
-        # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)
+        key = body.get("key", "")  # 2026-06-02 jinapp: 走 send-keys 真特殊键 (Escape/BTab/Up/Down/Enter/C-c…)
         session = body.get("session") or self.state.active_session or "opia"
         enter = bool(body.get("enter", True))
-        if not keys and not enter:
-            self._send_json(400, {"error": "keys or enter required"})
+        if not keys and not key and not enter:
+            self._send_json(400, {"error": "keys / key / enter required"})
             return
         try:
-            if keys:
-                # 用 load-buffer + paste-buffer 安全注入 (避免 - 开头被当 flag)
+            if key:
+                # 真特殊键 — 直接 tmux send-keys <key>, 不要 paste
+                subprocess.run(["tmux", "send-keys", "-t", session, key], check=False)
+            elif keys:
+                # 普通文字 — load-buffer + paste-buffer 安全注入 (避免 - 开头被当 flag)
                 p = subprocess.Popen(
                     ["tmux", "load-buffer", "-"],
                     stdin=subprocess.PIPE,
@@ -4747,11 +5217,14 @@ def run_server(state: ServerState):
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
-    from heartbeat import heartbeat_loop
-    heartbeat_thread = threading.Thread(
-        target=heartbeat_loop, args=(state,), daemon=True, name="heartbeat"
-    )
-    heartbeat_thread.start()
+    try:
+        from heartbeat import heartbeat_loop
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop, args=(state,), daemon=True, name="heartbeat"
+        )
+        heartbeat_thread.start()
+    except ImportError:
+        logger.warning("heartbeat module not found, skipping")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
