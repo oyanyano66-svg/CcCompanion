@@ -2178,6 +2178,24 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    // 2026-06-06 思考深度: 给 active session 发 /effort <level> slash command
+    // level: low / medium / high / max
+    private func handleEffortChange(_ level: String) async {
+        let activeSid = await fetchActiveSid()
+        guard let req = slashAuthedRequest(path: "tmux/send", jsonBody: ["keys": "/effort \(level)", "enter": true, "session": activeSid]) else {
+            appendCommandReply("/effort \(level) 失败 server URL 没配")
+            return
+        }
+        do {
+            _ = try await session.data(for: req)
+            // 切换成功才持久化 UI 状态
+            await MainActor.run { chatEffortLevel = level }
+            appendCommandReply("思考深度 → \(level)")
+        } catch {
+            appendCommandReply("/effort \(level) 失败 \(error.localizedDescription)")
+        }
+    }
+
     private func handleSlashClear() async {
         let activeSid = await fetchActiveSid()
         guard let req = slashAuthedRequest(path: "chain/clear", jsonBody: ["session": activeSid]) else {
@@ -2420,6 +2438,8 @@ struct ChatView: View {
     @AppStorage("ai_name") private var aiName: String = CcDefaultAIName
     @AppStorage("ai_avatar_path") private var aiAvatarPath: String = ""
     @AppStorage("chat_font_size_level") private var chatFontLevel: String = "medium"
+    // 2026-06-06 思考深度 (effort) — 走 /tmux/send 注入 /effort <level> slash command 到活跃 session
+    @AppStorage("chat_effort_level") private var chatEffortLevel: String = "high"
     // Phase E (item 7) — 聊天背景 disk path
     @AppStorage("chat_background_path") private var chatBackgroundPath: String = ""
     private var chatBodySize: CGFloat { chatFontLevel == "small" ? 15 : chatFontLevel == "large" ? 18 : 17 }
@@ -2621,7 +2641,9 @@ struct ChatView: View {
                     onEnterRP: {
                     },
                     onShowFavorites: onShowFavorites,
-                    onClearChat: { showClearChatConfirm = true }
+                    onClearChat: { showClearChatConfirm = true },
+                    currentEffort: chatEffortLevel,
+                    onEffortChange: { lvl in Task { await handleEffortChange(lvl) } }
                 )
             }
             .padding(.horizontal, 16)
@@ -3551,6 +3573,27 @@ private struct ChatToolbarTrailing: View {
     var onShowFavorites: (() -> Void)? = nil
     // 2026-05-12 clear-button restore — 砍后重加.
     var onClearChat: (() -> Void)? = nil
+    // 2026-06-06 思考深度
+    var currentEffort: String = "high"
+    var onEffortChange: ((String) -> Void)? = nil
+
+    // 颜色与图标按等级映射: max 暖紫 / high 强调色 / medium 中性 / low 灰
+    private func effortColor(_ lvl: String) -> Color {
+        switch lvl {
+        case "max": return Color(red: 0.55, green: 0.30, blue: 0.95)
+        case "high": return Color.ccAccent
+        case "medium": return Color.ccText
+        default: return Color.ccTextDim
+        }
+    }
+    private var effortIcon: String {
+        switch currentEffort {
+        case "max": return "brain.head.profile"
+        case "high": return "bolt.fill"
+        case "medium": return "bolt"
+        default: return "circle"
+        }
+    }
 
     var body: some View {
         if multiSelectMode {
@@ -3565,6 +3608,28 @@ private struct ChatToolbarTrailing: View {
                         .foregroundStyle(Color.ccAccent)
                 }
                 .accessibilityLabel("搜索")
+                // 2026-06-06 思考深度按钮 — 切档调 /tmux/send 注入 /effort <level>
+                if let onEffort = onEffortChange {
+                    Menu {
+                        Button(action: { onEffort("max") }) {
+                            Label(currentEffort == "max" ? "Max ✓" : "Max", systemImage: "brain.head.profile")
+                        }
+                        Button(action: { onEffort("high") }) {
+                            Label(currentEffort == "high" ? "High ✓" : "High", systemImage: "bolt.fill")
+                        }
+                        Button(action: { onEffort("medium") }) {
+                            Label(currentEffort == "medium" ? "Medium ✓" : "Medium", systemImage: "bolt")
+                        }
+                        Button(action: { onEffort("low") }) {
+                            Label(currentEffort == "low" ? "Low ✓" : "Low", systemImage: "circle")
+                        }
+                    } label: {
+                        Image(systemName: effortIcon)
+                            .font(.ccSerifAdaptive(size: 20, weight: .semibold))
+                            .foregroundStyle(effortColor(currentEffort))
+                    }
+                    .accessibilityLabel("思考深度 \(currentEffort)")
+                }
                 // Phase 设置大砍 (item C) — 直接 inline "收藏夹" 入口
                 if let showFav = onShowFavorites {
                     Button(action: showFav) {
