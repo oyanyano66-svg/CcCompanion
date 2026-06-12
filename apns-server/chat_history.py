@@ -420,6 +420,69 @@ class ChatHistory:
                     f.writelines(new_lines)
         return marked
 
+    def edit_text(self, ts: str, new_text: str) -> dict | None:
+        """编辑某条消息的文本 (rewrite jsonl), 标 edited. 返回更新后的记录或 None (2026-06-12)"""
+        if not self.path.exists() or not ts:
+            return None
+        updated = None
+        with self._lock:
+            with self.path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            new_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    new_lines.append(line)
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except Exception:
+                    new_lines.append(line)
+                    continue
+                if rec.get("ts") == ts and updated is None:
+                    rec["text"] = new_text
+                    rec["edited"] = True
+                    rec["edited_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    updated = rec
+                    new_lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
+                else:
+                    new_lines.append(line)
+            if updated:
+                with self.path.open("w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+        return updated
+
+    def hide_assistant_after(self, ts: str) -> list[str]:
+        """把 ts 之后的所有 assistant 记录标 hidden_in_ui (编辑用户消息后旧回复作废). 返回被隐藏的 ts 列表"""
+        if not self.path.exists() or not ts:
+            return []
+        hidden: list[str] = []
+        with self._lock:
+            with self.path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            new_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    new_lines.append(line)
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except Exception:
+                    new_lines.append(line)
+                    continue
+                if rec.get("role") == "assistant" and rec.get("ts", "") > ts and not rec.get("hidden_in_ui"):
+                    rec["hidden_in_ui"] = True
+                    rec["regenerated_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    hidden.append(rec.get("ts", ""))
+                    new_lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
+                else:
+                    new_lines.append(line)
+            if hidden:
+                with self.path.open("w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+        return hidden
+
     def delete(self, ts: str) -> bool:
         """按 ts 精确删一条 (rewrite jsonl). 返回是否找到并删除"""
         if not self.path.exists():

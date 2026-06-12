@@ -1045,6 +1045,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_regenerate(body)
+        elif self.path == "/chat/edit":
+            # 编辑也要 Escape 注入 — 同 regenerate 走 remote control gate
+            if not self.state.allow_remote_control:
+                self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
+                return
+            self._handle_chat_edit(body)
         elif self.path == "/heartbeat/config":
             hb = getattr(self.state, "heartbeat", None)
             if hb:
@@ -4089,17 +4095,19 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.info("chat/regenerate extra_marked=%d ids=%s", extra_marked, extra_replace_ids)
 
         # 中断 chain (tmux Escape x 3 复用 chain_abort 逻辑)
+        # 2026-06-12: 修硬编码 opia — Escape 必须发给当前 chat session (jinappchat)
+        target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
         try:
             import subprocess
             import time as _t
             for i in range(3):
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", "opia", "Escape"],
+                    ["tmux", "send-keys", "-t", target_session, "Escape"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if i < 2:
                     _t.sleep(0.2)
-            logger.info("chat/regenerate sent 3x Escape to opia tmux")
+            logger.info("chat/regenerate sent 3x Escape to %s tmux", target_session)
         except Exception as e:
             logger.warning("chat/regenerate tmux abort fail: %s", e)
 
@@ -4122,7 +4130,6 @@ class PushHandler(BaseHTTPRequestHandler):
         self.state.typing_state = {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")}
 
         # 注入 regenerate 文本到 chat session
-        target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
             self._send_json(502, {
@@ -4141,6 +4148,64 @@ class PushHandler(BaseHTTPRequestHandler):
             "extra_marked": extra_marked,
             "interrupted": True,
         })
+
+    def _handle_chat_edit(self, body: dict[str, Any]):
+        """2026-06-12 小玉工单: 编辑自己最新一条消息.
+        flow:
+        1 chat_history 改该条文本 + 标 edited
+        2 其后所有 assistant 回复标 hidden_in_ui (旧回复作废)
+        3 中断 chain (Escape x3) + 注入 [edit] 标记让主 session 基于新内容重新回复
+        body: {"ts": "...", "new_text": "..."}
+        """
+        ts = str(body.get("ts") or "").strip()
+        new_text = str(body.get("new_text") or "").strip()
+        if not ts or not new_text:
+            self._send_json(400, {"error": "ts and new_text required"})
+            return
+
+        rec = self.state.chat.edit_text(ts, new_text)
+        if not rec:
+            self._send_json(404, {"error": f"message ts={ts} not found"})
+            return
+        hidden = self.state.chat.hide_assistant_after(ts)
+        logger.info("chat/edit ts=%s hidden_after=%d", ts, len(hidden))
+
+        target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
+        try:
+            import subprocess
+            import time as _t
+            for i in range(3):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target_session, "Escape"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if i < 2:
+                    _t.sleep(0.2)
+        except Exception as e:
+            logger.warning("chat/edit tmux abort fail: %s", e)
+        try:
+            import time as _t2
+            _t2.sleep(0.5)
+        except Exception:
+            pass
+
+        from datetime import datetime as _dt
+        ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
+        tts_hint = ""
+        if self.state.settings.get("tts_enabled"):
+            tts_hint = "[语音模式 这一条带标点回复]\n"
+        injected = f"{ts_prefix} {tts_hint}[edit 小玉把上一条消息编辑成了下面的内容 基于编辑后的内容重新回复] {new_text}"
+
+        self.state.typing_state = {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")}
+        ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
+        if not ok:
+            self._send_json(502, {
+                "ok": False,
+                "error": f"inject edit to '{target_session}' failed: {err}",
+                "record": rec,
+            })
+            return
+        self._send_json(200, {"ok": True, "record": rec, "hidden": hidden})
 
     def _handle_chat_append(self, body: dict[str, Any]):
         """bus_stop_hook 抓到回复后调 → 写 assistant 条 + push spoke 状态
