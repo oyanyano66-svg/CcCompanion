@@ -3763,7 +3763,6 @@ class PushHandler(BaseHTTPRequestHandler):
 
         def _async_side_effects():
             try:
-                live_activity_delivered = 0
                 if active_tokens_snapshot and self.state.apns_enabled:
                     cs: dict[str, Any] = {
                         "status": "spoke",
@@ -3788,30 +3787,16 @@ class PushHandler(BaseHTTPRequestHandler):
                     apns_t0 = time.time()
                     for tok in active_tokens_snapshot:
                         try:
-                            resp: APNsResponse = self.state.client.push_live_activity(
+                            self.state.client.push_live_activity(
                                 push_token=tok.token,
                                 **push_kwargs,
                             )
-                            if resp.ok:
-                                live_activity_delivered += 1
-                                self.state.tokens.touch(tok.activity_id)
-                            elif resp.status == 410:
-                                self.state.tokens.unregister(tok.activity_id)
                         except Exception as e:
                             logger.warning("push spoke fail: %s", e)
                     apns_ms = int((time.time() - apns_t0) * 1000)
-                    print(
-                        f"apns_live_ms={apns_ms} tokens={len(active_tokens_snapshot)} delivered={live_activity_delivered}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                # standard remote notification banner (非灵动岛) — 跳过 [op] 前缀和非 assistant.
-                # 如果灵动岛已经接收了本次 "spoke/回好了" update, 就不再补普通 banner,
-                # 避免锁屏上同时出现 Live Activity 卡片和 Cc 通知两条同文案提醒.
+                    print(f"apns_live_ms={apns_ms} tokens={len(active_tokens_snapshot)}", file=sys.stderr, flush=True)
+                # standard remote notification banner (非灵动岛) — 跳过 [op] 前缀和非 assistant
                 if role == "assistant" and push_text_snap and not push_text_snap.startswith("[op]"):
-                    if live_activity_delivered > 0:
-                        print("notification_skipped=live_activity", file=sys.stderr, flush=True)
-                        return
                     notif_t0 = time.time()
                     self._send_chat_notification(self.state.device_tokens.default_ai_name(), push_text_snap[:80])
                     notif_ms = int((time.time() - notif_t0) * 1000)
