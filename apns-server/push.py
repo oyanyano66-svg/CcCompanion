@@ -3530,18 +3530,41 @@ class PushHandler(BaseHTTPRequestHandler):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
+        composer_meta = body.get("composer_metadata") or None
+        logger.info("chat/send body keys=%s composer_meta=%s", list(body.keys()), composer_meta)
         if not text and not location:
             self._send_json(400, {"error": "text or location required"})
             return
         if text.strip().lower() == "/usage":
             return self._handle_slash_usage()
-        # 写 user 历史
+
+        # ── 萝卜安全词 ──
+        if composer_meta and composer_meta.get("safe_word_triggered"):
+            target_session = (self.state.chat_session or self.state.active_session or "opia").strip()
+            try:
+                _sp.run(["tmux", "send-keys", "-t", target_session, "Escape"],
+                        capture_output=True, text=True, timeout=3)
+            except Exception:
+                pass
+            self.state.typing_state = {"is_typing": False, "since": ""}
+            rec = self.state.chat.append(
+                role="user", text="萝卜", source="ios-app",
+                metadata={"composer": composer_meta},
+            )
+            aftercare_msg = "[安全词触发] 小狗狗说了萝卜。立刻停止一切动作。进入aftercare：抱住她，问她哪里不舒服，告诉她她很安全，主人在。"
+            self._inject_to_session(target_session, aftercare_msg, source="ios-app", sender="iphone")
+            self._send_json(200, {"ok": True, "record": rec, "safe_word": True})
+            return
+
+        # ── 写 user 历史（composer_metadata 存入 metadata 字段，气泡只显示 text）──
+        rec_metadata = {"composer": composer_meta} if composer_meta else None
         rec = self.state.chat.append(
             role="user",
             text=text,
             source="ios-app",
             quoted_ts=quoted_ts,
             location=location,
+            metadata=rec_metadata,
         )
         # 包 quote 进注入文本 (主 session 收到 channel tag 内含 quote 上下文 + 时间戳跟 wechat 一致)
         from datetime import datetime as _dt
@@ -3550,18 +3573,25 @@ class PushHandler(BaseHTTPRequestHandler):
         tts_hint = ""
         if self.state.settings.get("tts_enabled"):
             tts_hint = "[语音模式 这一条带标点回复]\n"
-        injected = f"{ts_prefix} {tts_hint}{text}"
+
+        # ── arousal 注入（Ember 看得到，气泡里不显示）──
+        arousal_hint = ""
+        if composer_meta and composer_meta.get("arousal"):
+            a = composer_meta["arousal"]
+            arousal_hint = f"[arousal {a.get('value', '?')}/10 {a.get('label', '')}]\n"
+
+        injected = f"{ts_prefix} {tts_hint}{arousal_hint}{text}"
         if rec.get("location"):
             loc = rec["location"]
             label = loc.get("label", "")
             loc_str = f"[位置 lat={loc['lat']:.6f} lon={loc['lon']:.6f}{(' ' + label) if label else ''}]"
-            injected = f"{ts_prefix} {tts_hint}{loc_str}"
+            injected = f"{ts_prefix} {tts_hint}{arousal_hint}{loc_str}"
             if text:
                 injected = f"{injected}\n{text}"
         if rec.get("quoted_text"):
-            injected = f"{ts_prefix} {tts_hint}[引用 \"{rec['quoted_text']}\"]\n{text}"
+            injected = f"{ts_prefix} {tts_hint}{arousal_hint}[引用 \"{rec['quoted_text']}\"]\n{text}"
             if rec.get("location"):
-                injected = f"{ts_prefix} {tts_hint}[引用 \"{rec['quoted_text']}\"]\n{loc_str}"
+                injected = f"{ts_prefix} {tts_hint}{arousal_hint}[引用 \"{rec['quoted_text']}\"]\n{loc_str}"
                 if text:
                     injected = f"{injected}\n{text}"
         # set typing — Cc 收到 message 在 thinking
@@ -4318,6 +4348,20 @@ class PushHandler(BaseHTTPRequestHandler):
         if metadata and not isinstance(metadata, dict):
             metadata = None
 
+        # choices: 从 body 直接传 或 从 text 里解析 <!--choices:[...]-->
+        choices = body.get("choices") or None
+        if choices and not isinstance(choices, list):
+            choices = None
+        if not choices and text:
+            import re
+            m = re.search(r'<!--choices:\s*(\[.*?\])\s*-->', text)
+            if m:
+                try:
+                    choices = json.loads(m.group(1))
+                    text = re.sub(r'\s*<!--choices:\s*\[.*?\]\s*-->\s*', '', text).strip()
+                except Exception:
+                    choices = None
+
         rec = self.state.chat.append(
             role=role,
             text=text,
@@ -4326,6 +4370,7 @@ class PushHandler(BaseHTTPRequestHandler):
             attachment_type=attachment_type,
             attachment_filename=attachment_filename,
             metadata=metadata,
+            choices=choices,
         )
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
@@ -4869,7 +4914,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _get_ccusage_cached(self) -> dict:
-        """调 ccusage blocks --json，结果缓存 5 分钟到 tokens/ccusage_cache.json"""
+        """调本地自定义 ccusage json (套餐额度百分比)，结果缓存 5 分钟到 tokens/ccusage_cache.json"""
         cache_path = Path(self.state.token_store_path).parent / "ccusage_cache.json"
         # 读缓存
         if cache_path.exists():
@@ -4880,14 +4925,14 @@ class PushHandler(BaseHTTPRequestHandler):
                     return cached
             except Exception:
                 pass
-        # 跑 ccusage
-        candidates = ["/opt/homebrew/bin/ccusage", "ccusage"]
+        # 跑本地 ccusage json: 输出 plan / 5h / 7d / 7d_sonnet / extra_usage
+        candidates = ["/usr/local/bin/ccusage", "ccusage"]
         raw_data: dict | None = None
         for exe in candidates:
             try:
                 res = subprocess.run(
-                    [exe, "blocks", "--json"],
-                    capture_output=True, text=True, timeout=15,
+                    [exe, "json"],
+                    capture_output=True, text=True, timeout=30,
                 )
                 if res.returncode == 0:
                     raw_data = json.loads(res.stdout)
@@ -4900,20 +4945,17 @@ class PushHandler(BaseHTTPRequestHandler):
         if raw_data is None:
             return {"available": False, "error": "ccusage not installed"}
 
-        blocks = raw_data.get("blocks", [])
-        active = next((b for b in blocks if b.get("isActive")), None)
-        result: dict = {"available": True}
-        if active:
-            proj = active.get("projection") or {}
-            result["active_block"] = {
-                "cost_usd": round(active.get("costUSD", 0.0), 2),
-                "tokens": active.get("totalTokens", 0),
-                "end_time": active.get("endTime", ""),
-                "minutes_until_reset": proj.get("remainingMinutes"),
-                "models": active.get("models", []),
-            }
-        else:
-            result["active_block"] = None
+        result: dict = {
+            "available": True,
+            "plan": raw_data.get("plan"),
+            "updated_at": raw_data.get("updated_at"),
+            "windows": {
+                key: raw_data[key]
+                for key in ("5h", "7d", "7d_sonnet")
+                if isinstance(raw_data.get(key), dict)
+            },
+            "extra_usage": raw_data.get("extra_usage"),
+        }
         # 写缓存
         try:
             cache_path.write_text(
